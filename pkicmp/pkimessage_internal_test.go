@@ -1,0 +1,524 @@
+package pkicmp
+
+import (
+	"crypto/x509/pkix"
+	"encoding/asn1"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/cryptobyte"
+	cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
+)
+
+// RFC 9810 §5.1.1 (PKIHeader ASN.1 tests)
+func TestPKIHeaderASN1(t *testing.T) {
+	t.Run("MarshalAndUnmarshalFull", func(t *testing.T) {
+		now := time.Now().Truncate(time.Second).UTC()
+		h := &PKIHeader{
+			PVNO: PVNO2,
+			Sender: NewDirectoryName(pkix.RDNSequence{{{
+				Type:  asn1.ObjectIdentifier{2, 5, 4, 3},
+				Value: "Sender",
+			}}}),
+			Recipient: NewDirectoryName(pkix.RDNSequence{{{
+				Type:  asn1.ObjectIdentifier{2, 5, 4, 3},
+				Value: "Recipient",
+			}}}),
+			MessageTime:   now,
+			ProtectionAlg: &AlgorithmIdentifier{Algorithm: OIDSHA256},
+			SenderKID:     []byte{0x01},
+			RecipKID:      []byte{0x02},
+			TransactionID: []byte{0x03},
+			SenderNonce:   []byte{0x04},
+			RecipNonce:    []byte{0x05},
+			FreeText:      PKIFreeText{"text"},
+			GeneralInfo:   []InfoTypeAndValue{{InfoType: OIDSHA256}},
+		}
+
+		var b cryptobyte.Builder
+		h.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, &b)
+		marshaled, err := b.Bytes()
+		require.NoError(t, err)
+
+		var unmarshaled PKIHeader
+		s := cryptobyte.String(marshaled)
+		err = unmarshaled.unmarshal(&s)
+		require.NoError(t, err)
+
+		assert.Equal(t, h.PVNO, unmarshaled.PVNO)
+		assert.Equal(t, h.MessageTime.Unix(), unmarshaled.MessageTime.Unix())
+		assert.Equal(t, h.SenderKID, unmarshaled.SenderKID)
+		assert.Equal(t, h.RecipKID, unmarshaled.RecipKID)
+		assert.Equal(t, h.TransactionID, unmarshaled.TransactionID)
+		assert.Equal(t, h.SenderNonce, unmarshaled.SenderNonce)
+		assert.Equal(t, h.RecipNonce, unmarshaled.RecipNonce)
+		assert.Equal(t, h.FreeText, unmarshaled.FreeText)
+		assert.Equal(t, h.GeneralInfo[0].InfoType, unmarshaled.GeneralInfo[0].InfoType)
+	})
+
+	t.Run("UnmarshalCMPv1Error", func(t *testing.T) {
+		var b cryptobyte.Builder
+		b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+			b.AddASN1Int64(1) // PVNO1
+			gn := NewDirectoryName(pkix.RDNSequence{})
+			gn.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+			gn.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+		})
+		marshaled, _ := b.Bytes()
+		var unmarshaled PKIHeader
+		s := cryptobyte.String(marshaled)
+		err := unmarshaled.unmarshal(&s)
+		if assert.Error(t, err) {
+			assert.Contains(t, err.Error(), "CMPv1 is not supported")
+		}
+	})
+
+	t.Run("UnmarshalErrors", func(t *testing.T) {
+		t.Run("InvalidSequence", func(t *testing.T) {
+			var unmarshaled PKIHeader
+			s := cryptobyte.String([]byte{0x00})
+			err := unmarshaled.unmarshal(&s)
+			assert.Error(t, err)
+		})
+		t.Run("InvalidPVNO", func(t *testing.T) {
+			var b cryptobyte.Builder
+			b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+				b.AddASN1Int64(2)
+				// Missing sender and recipient
+			})
+			marshaled, _ := b.Bytes()
+			var unmarshaled PKIHeader
+			s := cryptobyte.String(marshaled)
+			err := unmarshaled.unmarshal(&s)
+
+			assert.Error(t, err)
+		})
+		t.Run("InvalidOptionalFields", func(t *testing.T) {
+			marshalBase := func(b *cryptobyte.Builder) {
+				b.AddASN1Int64(2)
+				gn := NewDirectoryName(pkix.RDNSequence{})
+				gn.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+				gn.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+			}
+
+			t.Run("InvalidMessageTime", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(0).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddUint8(0x01) // Not a GeneralizedTime
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+
+			t.Run("InvalidProtectionAlg", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(1).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddUint8(0x01) // Not a sequence
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+
+			t.Run("InvalidFreeText", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(7).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddUint8(0x01) // Not a sequence
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+
+			t.Run("InvalidGeneralInfo", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(8).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddUint8(0x01) // Not a sequence
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+
+			t.Run("InvalidRecipNonce", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(6).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddBytes([]byte{0x04, 0xff}) // tag 4 (OCTET STRING) but no data
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+
+			t.Run("InvalidGeneralInfoSequence", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(8).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddUint8(0x02) // Should have been 0x30 for SEQUENCE
+						b.AddUint8(0x00)
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+
+			t.Run("InvalidSenderNonce", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(5).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddBytes([]byte{0x04, 0xff}) // tag 4
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+
+			t.Run("InvalidFreeTextTag", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(7).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddUint8(0x02) // Should have been 0x30 for SEQUENCE
+						b.AddUint8(0x00)
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+
+			t.Run("InvalidRecipKID", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(3).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddBytes([]byte{0x04, 0xff}) // tag 4
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+
+			t.Run("InvalidTransactionID", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(4).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddBytes([]byte{0x04, 0xff}) // tag 4
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+
+			t.Run("InvalidSenderKID", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(2).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddBytes([]byte{0x04, 0xff}) // tag 4
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+
+			t.Run("InvalidInfoTypeAndValueOID", func(t *testing.T) {
+				var b cryptobyte.Builder
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					marshalBase(b)
+					b.AddASN1(cbasn1.Tag(8).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+						b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+							b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+								b.AddUint8(0x01) // Not an OID
+							})
+						})
+					})
+				})
+				marshaled, _ := b.Bytes()
+				var unmarshaled PKIHeader
+				s := cryptobyte.String(marshaled)
+				err := unmarshaled.unmarshal(&s)
+
+				assert.Error(t, err)
+			})
+		})
+	})
+}
+
+func TestParsePKIMessage(t *testing.T) {
+	t.Run("Valid", func(t *testing.T) {
+		body, _ := NewPKIConfBody()
+		msg := &PKIMessage{
+			Header: PKIHeader{PVNO: PVNO2},
+			Body:   body,
+		}
+		der, _ := msg.MarshalBinary()
+		parsed, err := ParsePKIMessage(der)
+		assert.NoError(t, err)
+		assert.NotNil(t, parsed)
+	})
+	t.Run("Invalid", func(t *testing.T) {
+		_, err := ParsePKIMessage([]byte{0x00})
+		assert.Error(t, err)
+	})
+
+	t.Run("RejectsTrailingData", func(t *testing.T) {
+		body, _ := NewPKIConfBody()
+		msg := &PKIMessage{
+			Header: PKIHeader{PVNO: PVNO2},
+			Body:   body,
+		}
+		der, _ := msg.MarshalBinary()
+		der = append(der, 0x00)
+		_, err := ParsePKIMessage(der)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "trailing data")
+	})
+}
+
+func TestPKIMessagePVNOTigger(t *testing.T) {
+	t.Run("PVNO2", func(t *testing.T) {
+		body, _ := NewPKIConfBody()
+		msg := &PKIMessage{
+			Header: PKIHeader{
+				Sender:    NewDirectoryName(nil),
+				Recipient: NewDirectoryName(nil),
+			},
+			Body: body,
+		}
+		der, err := msg.MarshalBinary()
+		require.NoError(t, err)
+		parsed, err := ParsePKIMessage(der)
+		require.NoError(t, err)
+		assert.Equal(t, PVNO2, parsed.Header.PVNO)
+	})
+	t.Run("PVNO3", func(t *testing.T) {
+		// CertConf with HashAlg triggers PVNO3
+		conf := &CertConfirmContent{{
+			CertHash: []byte{0x01},
+			HashAlg:  &AlgorithmIdentifier{Algorithm: OIDSHA256},
+		}}
+		body, _ := NewCertConfBody(conf)
+		msg := &PKIMessage{
+			Header: PKIHeader{
+				Sender:    NewDirectoryName(nil),
+				Recipient: NewDirectoryName(nil),
+			},
+			Body: body,
+		}
+		der, err := msg.MarshalBinary()
+		require.NoError(t, err)
+		parsed, err := ParsePKIMessage(der)
+		require.NoError(t, err)
+		assert.Equal(t, PVNO3, parsed.Header.PVNO)
+	})
+}
+
+func TestPKIMessageVerifyErrors(t *testing.T) {
+	body, _ := NewPKIConfBody()
+	msg := &PKIMessage{Body: body}
+	err := msg.Verify(nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "message is not protected")
+}
+
+// RFC 9810 §5.1 (PKIMessage ASN.1 tests)
+func TestPKIMessageASN1(t *testing.T) {
+	t.Run("MarshalAndUnmarshalOptional", func(t *testing.T) {
+		body, _ := NewPKIConfBody()
+		msg := &PKIMessage{
+			Header: PKIHeader{
+				Sender:    NewDirectoryName(nil),
+				Recipient: NewDirectoryName(nil),
+			},
+			Body:       body,
+			Protection: []byte{0xDE, 0xAD},
+			ExtraCerts: []CMPCertificate{{Raw: []byte{0x30, 0x03, 0x02, 0x01, 0x01}}},
+		}
+
+		marshaled, err := msg.MarshalBinary()
+		require.NoError(t, err)
+
+		var unmarshaled PKIMessage
+		err = unmarshaled.UnmarshalBinary(marshaled)
+		require.NoError(t, err)
+
+		assert.Equal(t, msg.Protection, unmarshaled.Protection)
+		assert.Len(t, unmarshaled.ExtraCerts, 1)
+	})
+
+	t.Run("UnmarshalErrors", func(t *testing.T) {
+		t.Run("NotASequence", func(t *testing.T) {
+			var unmarshaled PKIMessage
+			err := unmarshaled.UnmarshalBinary([]byte{0x00})
+			assert.Error(t, err)
+		})
+		t.Run("MissingBody", func(t *testing.T) {
+			var b cryptobyte.Builder
+			b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+				// Only Header
+				h := &PKIHeader{PVNO: PVNO2}
+				h.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+			})
+			marshaled, _ := b.Bytes()
+			var unmarshaled PKIMessage
+			err := unmarshaled.UnmarshalBinary(marshaled)
+			assert.Error(t, err)
+		})
+		t.Run("InvalidProtectionBitString", func(t *testing.T) {
+			var b cryptobyte.Builder
+			b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+				h := &PKIHeader{PVNO: PVNO2}
+				h.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+				body, _ := NewPKIConfBody()
+				body.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+				b.AddASN1(cbasn1.Tag(0).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+					b.AddUint8(0x02) // Not a BIT STRING (0x03)
+					b.AddUint8(0x00)
+				})
+			})
+			marshaled, _ := b.Bytes()
+			var unmarshaled PKIMessage
+			err := unmarshaled.UnmarshalBinary(marshaled)
+			assert.Error(t, err)
+		})
+
+		t.Run("InvalidProtectionUnusedBits", func(t *testing.T) {
+			var b cryptobyte.Builder
+			b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+				h := &PKIHeader{PVNO: PVNO2}
+				h.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+				body, _ := NewPKIConfBody()
+				body.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+				b.AddASN1(cbasn1.Tag(0).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+					b.AddASN1(cbasn1.BIT_STRING, func(b *cryptobyte.Builder) {
+						// Empty BIT STRING (no unused bits byte)
+					})
+				})
+			})
+			marshaled, _ := b.Bytes()
+			var unmarshaled PKIMessage
+			err := unmarshaled.UnmarshalBinary(marshaled)
+			assert.Error(t, err)
+		})
+		t.Run("InvalidExtraCertsTag", func(t *testing.T) {
+			var b cryptobyte.Builder
+			b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+				h := &PKIHeader{PVNO: PVNO2}
+				h.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+				body, _ := NewPKIConfBody()
+				body.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+				// Use wrong tag for extraCerts
+				b.AddASN1(cbasn1.Tag(1).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+					b.AddUint8(0x02) // Not a sequence
+				})
+			})
+			marshaled, _ := b.Bytes()
+			var unmarshaled PKIMessage
+			err := unmarshaled.UnmarshalBinary(marshaled)
+			assert.Error(t, err)
+		})
+
+		t.Run("InvalidExtraCertsSequence", func(t *testing.T) {
+			var b cryptobyte.Builder
+			b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+				h := &PKIHeader{PVNO: PVNO2}
+				h.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+				body, _ := NewPKIConfBody()
+				body.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+				b.AddASN1(cbasn1.Tag(1).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+					b.AddUint8(0x02) // Should have been 0x30 for SEQUENCE
+					b.AddUint8(0x00)
+				})
+			})
+			marshaled, _ := b.Bytes()
+			var unmarshaled PKIMessage
+			err := unmarshaled.UnmarshalBinary(marshaled)
+			assert.Error(t, err)
+		})
+
+		t.Run("InvalidExtraCertsElement", func(t *testing.T) {
+			var b cryptobyte.Builder
+			b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+				h := &PKIHeader{PVNO: PVNO2}
+				h.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+				body, _ := NewPKIConfBody()
+				body.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, b)
+				b.AddASN1(cbasn1.Tag(1).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+					b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+						b.AddUint8(0x01) // Not a sequence (CMPCertificate)
+					})
+				})
+			})
+			marshaled, _ := b.Bytes()
+			var unmarshaled PKIMessage
+			err := unmarshaled.UnmarshalBinary(marshaled)
+			assert.Error(t, err)
+		})
+
+		t.Run("MissingPKIMessageSequence", func(t *testing.T) {
+			var unmarshaled PKIMessage
+			err := unmarshaled.UnmarshalBinary([]byte{0x02, 0x01, 0x01}) // Just an integer
+			assert.Error(t, err)
+		})
+	})
+}

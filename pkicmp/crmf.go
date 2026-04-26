@@ -1,0 +1,578 @@
+package pkicmp
+
+import (
+	"crypto"
+	"crypto/rand"
+	"errors"
+	"fmt"
+
+	"golang.org/x/crypto/cryptobyte"
+	cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
+)
+
+// CertReqMessages per RFC 4211 §3.
+//
+//	CertReqMessages ::= SEQUENCE SIZE (1..MAX) OF CertReqMsg
+type CertReqMessages []CertReqMsg
+
+func (m *CertReqMessages) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
+	b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+		for _, req := range *m {
+			req.marshal(mctx, b)
+		}
+	})
+}
+
+func (m *CertReqMessages) unmarshal(s *cryptobyte.String) error {
+	var seq cryptobyte.String
+	if !s.ReadASN1(&seq, cbasn1.SEQUENCE) {
+		return errors.New("pkicmp: invalid CertReqMessages sequence")
+	}
+	for !seq.Empty() {
+		var req CertReqMsg
+		if err := req.unmarshal(&seq); err != nil {
+			return err
+		}
+		*m = append(*m, req)
+	}
+	return nil
+}
+
+// CertReqMsg per RFC 4211 §3.
+//
+//	CertReqMsg ::= SEQUENCE {
+//	    certReq   CertRequest,
+//	    popo      ProofOfPossession  OPTIONAL,
+//	    regInfo   SEQUENCE SIZE (1..MAX) OF AttributeTypeAndValue OPTIONAL
+//	}
+type CertReqMsg struct {
+	// CertReq holds the requested certificate contents.
+	CertReq CertRequest
+	// Popo proves the requester controls the referenced private key.
+	Popo *ProofOfPossession
+}
+
+func (m *CertReqMsg) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
+	b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+		m.CertReq.marshal(mctx, b)
+		if m.Popo != nil {
+			m.Popo.marshal(mctx, b)
+		}
+	})
+}
+
+// GeneratePOP generates a Signature ProofOfPossession using the provided private key
+// over the DER-encoded CertRequest and assigns it to m.Popo.
+func (m *CertReqMsg) GeneratePOP(key crypto.Signer) error {
+	mctx := &MarshalContext{MinRequiredPVNO: PVNO2}
+
+	var b cryptobyte.Builder
+	m.CertReq.marshal(mctx, &b)
+	certReqDER, err := b.Bytes()
+	if err != nil {
+		return fmt.Errorf("pkicmp: marshal CertRequest for POP: %w", err)
+	}
+
+	sigAlgOID, hashFunc, err := signatureAlgorithmFromKey(key)
+	if err != nil {
+		return err
+	}
+
+	var digest []byte
+	if hashFunc != 0 {
+		h := hashFunc.New()
+		h.Write(certReqDER)
+		digest = h.Sum(nil)
+	} else {
+		digest = certReqDER
+	}
+
+	sig, err := key.Sign(rand.Reader, digest, hashFunc)
+	if err != nil {
+		return fmt.Errorf("pkicmp: sign POP: %w", err)
+	}
+
+	m.Popo = &ProofOfPossession{
+		Signature: &POPOSigningKey{
+			Algorithm: AlgorithmIdentifier{Algorithm: sigAlgOID},
+			Signature: sig,
+		},
+	}
+
+	return nil
+}
+
+func (m *CertReqMsg) unmarshal(s *cryptobyte.String) error {
+	var seq cryptobyte.String
+	if !s.ReadASN1(&seq, cbasn1.SEQUENCE) {
+		return errors.New("pkicmp: invalid CertReqMsg sequence")
+	}
+	if err := m.CertReq.unmarshal(&seq); err != nil {
+		return err
+	}
+
+	if !seq.Empty() && !seq.PeekASN1Tag(cbasn1.SEQUENCE) {
+		// ProofOfPossession is a CHOICE, so it has context tags [0], [1], [2], [3]
+		m.Popo = &ProofOfPossession{}
+		if err := m.Popo.unmarshal(&seq); err != nil {
+			return err
+		}
+	}
+
+	// Ignore RegInfo for now if present (it's a SEQUENCE)
+	return nil
+}
+
+// CertRequest per RFC 4211 §3.
+//
+//	CertRequest ::= SEQUENCE {
+//	    certReqId     INTEGER,
+//	    certTemplate  CertTemplate,
+//	    controls      Controls OPTIONAL
+//	}
+type CertRequest struct {
+	// CertReqID links this request to its corresponding response item.
+	CertReqID int64
+	// CertTemplate describes subject, key, and extension preferences.
+	CertTemplate CertTemplate
+}
+
+func (r *CertRequest) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
+	b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+		b.AddASN1Int64(r.CertReqID)
+		r.CertTemplate.marshal(mctx, b)
+	})
+}
+
+func (r *CertRequest) unmarshal(s *cryptobyte.String) error {
+	var seq cryptobyte.String
+	if !s.ReadASN1(&seq, cbasn1.SEQUENCE) {
+		return errors.New("pkicmp: invalid CertRequest sequence")
+	}
+	if !seq.ReadASN1Integer(&r.CertReqID) {
+		return errors.New("pkicmp: invalid certReqId")
+	}
+	return r.CertTemplate.unmarshal(&seq)
+}
+
+// CertTemplate per RFC 4211 §2.
+type CertTemplate struct {
+	// Subject is the requested certificate subject DN.
+	Subject    GeneralName
+	PublicKey  []byte // Raw DER SubjectPublicKeyInfo
+	Extensions []byte // Raw DER Extensions
+}
+
+func (t *CertTemplate) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
+	b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+		if len(t.Subject.DirectoryName) > 0 {
+			// subject [5] Name OPTIONAL
+			// Name is CHOICE { rdnSequence RDNSequence }
+			// Tagging a CHOICE is always EXPLICIT, so we keep it as is.
+			b.AddASN1(cbasn1.Tag(5).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+				marshalRDNSequence(b, t.Subject.DirectoryName)
+			})
+		}
+		if len(t.PublicKey) > 0 {
+			// publicKey [6] SubjectPublicKeyInfo OPTIONAL
+			// SubjectPublicKeyInfo is a SEQUENCE.
+			// IMPLICIT tagging means [6] replaces the SEQUENCE tag.
+			content, err := stripSequence(t.PublicKey)
+			if err != nil {
+				b.SetError(fmt.Errorf("pkicmp: invalid publicKey DER: %w", err))
+				return
+			}
+			b.AddASN1(cbasn1.Tag(6).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+				b.AddBytes(content)
+			})
+		}
+		if len(t.Extensions) > 0 {
+			// extensions [9] Extensions OPTIONAL
+			// Extensions is a SEQUENCE.
+			// IMPLICIT tagging means [9] replaces the SEQUENCE tag.
+			content, err := stripSequence(t.Extensions)
+			if err != nil {
+				b.SetError(fmt.Errorf("pkicmp: invalid extensions DER: %w", err))
+				return
+			}
+			b.AddASN1(cbasn1.Tag(9).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+				b.AddBytes(content)
+			})
+		}
+	})
+}
+
+func (t *CertTemplate) unmarshal(s *cryptobyte.String) error {
+	var seq cryptobyte.String
+	if !s.ReadASN1(&seq, cbasn1.SEQUENCE) {
+		return errors.New("pkicmp: invalid CertTemplate sequence")
+	}
+
+	for !seq.Empty() {
+		var sub cryptobyte.String
+		var tag cbasn1.Tag
+		if !seq.ReadAnyASN1Element(&sub, &tag) {
+			return errors.New("pkicmp: invalid CertTemplate element")
+		}
+
+		switch tag {
+		case cbasn1.Tag(5).ContextSpecific().Constructed():
+			var content cryptobyte.String
+			if !sub.ReadASN1(&content, tag) {
+				return errors.New("pkicmp: invalid subject tag")
+			}
+			if err := parseRDNSequence(&content, &t.Subject.DirectoryName); err != nil {
+				return err
+			}
+		case cbasn1.Tag(6).ContextSpecific().Constructed():
+			var content cryptobyte.String
+			if !sub.ReadASN1(&content, tag) {
+				return errors.New("pkicmp: invalid publicKey tag")
+			}
+			t.PublicKey = wrapSequence(content)
+		case cbasn1.Tag(9).ContextSpecific().Constructed():
+			var content cryptobyte.String
+			if !sub.ReadASN1(&content, tag) {
+				return errors.New("pkicmp: invalid extensions tag")
+			}
+			t.Extensions = wrapSequence(content)
+		default:
+			// Skip unknown optional fields for now
+		}
+	}
+	return nil
+}
+
+// ProofOfPossession per RFC 4211 §4.
+
+//	ProofOfPossession ::= CHOICE {
+//	    raVerified        [0] NULL,
+//	    signature         [1] POPOSigningKey,
+//	    keyEncipherment   [2] POPOPrivKey,
+//	    keyAgreement      [3] POPOPrivKey
+//	}
+type ProofOfPossession struct {
+	// RAVerified means the RA has already verified key possession.
+	RAVerified bool
+	// Signature carries a signature-based POP proof.
+	Signature *POPOSigningKey
+	// KeyEncipherment carries encryption-based POP material.
+	KeyEncipherment *POPOPrivKey
+	// KeyAgreement carries agreement-based POP material.
+	KeyAgreement *POPOPrivKey
+}
+
+func (p *ProofOfPossession) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
+	if p.RAVerified {
+		// raVerified [0] NULL (IMPLICIT)
+		b.AddASN1(cbasn1.Tag(0).ContextSpecific(), func(b *cryptobyte.Builder) {})
+	} else if p.Signature != nil {
+		// signature [1] POPOSigningKey (IMPLICIT)
+		// POPOSigningKey is a SEQUENCE.
+		b.AddASN1(cbasn1.Tag(1).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+			p.Signature.marshalInner(mctx, b)
+		})
+	} else if p.KeyEncipherment != nil {
+		// keyEncipherment [2] POPOPrivKey (EXPLICIT because POPOPrivKey is a CHOICE)
+		b.AddASN1(cbasn1.Tag(2).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+			p.KeyEncipherment.marshal(mctx, b)
+		})
+	} else if p.KeyAgreement != nil {
+		// keyAgreement [3] POPOPrivKey (EXPLICIT because POPOPrivKey is a CHOICE)
+		b.AddASN1(cbasn1.Tag(3).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+			p.KeyAgreement.marshal(mctx, b)
+		})
+	}
+}
+
+func (p *ProofOfPossession) unmarshal(s *cryptobyte.String) error {
+	var sub cryptobyte.String
+	var tag cbasn1.Tag
+	if !s.ReadAnyASN1(&sub, &tag) {
+		return errors.New("pkicmp: missing ProofOfPossession")
+	}
+
+	switch tag {
+	case cbasn1.Tag(0).ContextSpecific():
+		p.RAVerified = true
+	case cbasn1.Tag(1).ContextSpecific().Constructed():
+		// signature [1] IMPLICIT POPOSigningKey (SEQUENCE)
+		p.Signature = &POPOSigningKey{}
+		return p.Signature.unmarshalInner(&sub)
+	case cbasn1.Tag(2).ContextSpecific().Constructed():
+		// keyEncipherment [2] EXPLICIT POPOPrivKey (CHOICE)
+		p.KeyEncipherment = &POPOPrivKey{}
+		return p.KeyEncipherment.unmarshal(&sub)
+	case cbasn1.Tag(3).ContextSpecific().Constructed():
+		// keyAgreement [3] EXPLICIT POPOPrivKey (CHOICE)
+		p.KeyAgreement = &POPOPrivKey{}
+		return p.KeyAgreement.unmarshal(&sub)
+	default:
+		return fmt.Errorf("pkicmp: unsupported ProofOfPossession variant: %d", tag)
+	}
+	return nil
+}
+
+// POPOPrivKey per RFC 9810 §5.2.8.
+//
+//	POPOPrivKey ::= CHOICE {
+//	    thisMessage       [0] BIT STRING,         -- deprecated
+//	    subsequentMessage [1] SubsequentMessage,
+//	    dhMAC             [2] BIT STRING,         -- deprecated
+//	    agreeMAC          [3] PKMACValue,
+//	    encryptedKey      [4] EnvelopedData
+//	}
+type POPOPrivKey struct {
+	// SubsequentMessage carries the subsequentMessage [1] value (RFC 9810 §5.2.8.3).
+	SubsequentMessage *int64
+	// EncryptedKey carries the encryptedKey [4] value (RFC 9810 §5.2.8.3).
+	EncryptedKey *EnvelopedData
+}
+
+func (p *POPOPrivKey) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
+	if p.SubsequentMessage != nil {
+		// subsequentMessage [1] SubsequentMessage (IMPLICIT)
+		// SubsequentMessage is an INTEGER.
+		b.AddASN1(cbasn1.Tag(1).ContextSpecific(), func(b *cryptobyte.Builder) {
+			b.AddBytes(marshalImplicitInt64(*p.SubsequentMessage))
+		})
+	} else if p.EncryptedKey != nil {
+		mctx.MinRequiredPVNO = PVNO3
+		// encryptedKey [4] EnvelopedData (IMPLICIT)
+		// EnvelopedData is a SEQUENCE.
+		b.AddASN1(cbasn1.Tag(4).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+			p.EncryptedKey.marshalInner(mctx, b)
+		})
+	}
+}
+
+func (p *POPOPrivKey) unmarshal(s *cryptobyte.String) error {
+	var sub cryptobyte.String
+	var tag cbasn1.Tag
+	if !s.ReadAnyASN1(&sub, &tag) {
+		return errors.New("pkicmp: missing POPOPrivKey")
+	}
+
+	switch tag {
+	case cbasn1.Tag(1).ContextSpecific():
+		// subsequentMessage [1] IMPLICIT INTEGER
+		val, err := unmarshalImplicitInt64(sub)
+		if err != nil {
+			return err
+		}
+		p.SubsequentMessage = &val
+	case cbasn1.Tag(4).ContextSpecific().Constructed():
+		// encryptedKey [4] IMPLICIT EnvelopedData (SEQUENCE)
+		p.EncryptedKey = &EnvelopedData{}
+		return p.EncryptedKey.unmarshalInner(&sub)
+	default:
+		return fmt.Errorf("pkicmp: unsupported POPOPrivKey variant: %d", tag)
+	}
+	return nil
+}
+
+// Challenge per RFC 9810 §5.2.8.3.3.
+//
+//	Challenge ::= SEQUENCE {
+//	    owf                 AlgorithmIdentifier OPTIONAL,
+//	    witness             OCTET STRING,
+//	    challenge           OCTET STRING,           -- deprecated
+//	    encryptedRand   [0] EnvelopedData OPTIONAL
+//	}
+type Challenge struct {
+	// OWF is the optional hash/KDF used for witness handling.
+	OWF *AlgorithmIdentifier
+	// Witness is the challenge witness used in POP verification.
+	Witness []byte
+	// EncryptedRand carries an encrypted random challenge value.
+	EncryptedRand *EnvelopedData
+}
+
+func (c *Challenge) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
+	b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+		if c.OWF != nil {
+			c.OWF.marshal(mctx, b)
+		}
+		b.AddASN1OctetString(c.Witness)
+		b.AddASN1OctetString(nil) // Empty deprecated challenge
+		if c.EncryptedRand != nil {
+			mctx.MinRequiredPVNO = PVNO3
+			// encryptedRand [0] EnvelopedData (IMPLICIT)
+			b.AddASN1(cbasn1.Tag(0).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+				c.EncryptedRand.marshalInner(mctx, b)
+			})
+		}
+	})
+}
+
+func (c *Challenge) unmarshal(s *cryptobyte.String) error {
+	var seq cryptobyte.String
+	if !s.ReadASN1(&seq, cbasn1.SEQUENCE) {
+		return errors.New("pkicmp: invalid Challenge sequence")
+	}
+
+	if !seq.Empty() && seq.PeekASN1Tag(cbasn1.SEQUENCE) {
+		c.OWF = &AlgorithmIdentifier{}
+		if err := c.OWF.unmarshal(&seq); err != nil {
+			return err
+		}
+	}
+
+	if !seq.ReadASN1Bytes(&c.Witness, cbasn1.OCTET_STRING) {
+		return errors.New("pkicmp: invalid witness")
+	}
+
+	var deprecatedChallenge []byte
+	if !seq.ReadASN1Bytes(&deprecatedChallenge, cbasn1.OCTET_STRING) {
+		return errors.New("pkicmp: missing deprecated challenge")
+	}
+
+	if !seq.Empty() && seq.PeekASN1Tag(cbasn1.Tag(0).ContextSpecific().Constructed()) {
+		var sub cryptobyte.String
+		if !seq.ReadASN1(&sub, cbasn1.Tag(0).ContextSpecific().Constructed()) {
+			return errors.New("pkicmp: invalid encryptedRand tag")
+		}
+		c.EncryptedRand = &EnvelopedData{}
+		if err := c.EncryptedRand.unmarshalInner(&sub); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// POPOSigningKey per RFC 4211 §4.1.
+//
+//	POPOSigningKey ::= SEQUENCE {
+//	    poposkInput           [0] POPOSigningKeyInput OPTIONAL,
+//	    algorithmIdentifier   AlgorithmIdentifier,
+//	    signature             BIT STRING
+//	}
+type POPOSigningKey struct {
+	// PoposkInput carries optional sender-identity bound to the proof.
+	PoposkInput *POPOSigningKeyInput
+	// Algorithm identifies how the POP signature was generated.
+	Algorithm AlgorithmIdentifier
+	// Signature is the POP signature output bytes.
+	Signature []byte
+}
+
+func (p *POPOSigningKey) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
+	b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+		p.marshalInner(mctx, b)
+	})
+}
+
+func (p *POPOSigningKey) marshalInner(mctx *MarshalContext, b *cryptobyte.Builder) {
+	if p.PoposkInput != nil {
+		// poposkInput [0] POPOSigningKeyInput (IMPLICIT)
+		b.AddASN1(cbasn1.Tag(0).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+			p.PoposkInput.marshalInner(mctx, b)
+		})
+	}
+	p.Algorithm.marshal(mctx, b)
+	b.AddASN1(cbasn1.BIT_STRING, func(b *cryptobyte.Builder) {
+		b.AddUint8(0) // No unused bits
+		b.AddBytes(p.Signature)
+	})
+}
+
+func (p *POPOSigningKey) unmarshal(s *cryptobyte.String) error {
+	var seq cryptobyte.String
+	if !s.ReadASN1(&seq, cbasn1.SEQUENCE) {
+		return errors.New("pkicmp: invalid POPOSigningKey sequence")
+	}
+	return p.unmarshalInner(&seq)
+}
+
+func (p *POPOSigningKey) unmarshalInner(seq *cryptobyte.String) error {
+	if seq.PeekASN1Tag(cbasn1.Tag(0).ContextSpecific().Constructed()) {
+		var sub cryptobyte.String
+		if !seq.ReadASN1(&sub, cbasn1.Tag(0).ContextSpecific().Constructed()) {
+			return errors.New("pkicmp: invalid poposkInput tag")
+		}
+		p.PoposkInput = &POPOSigningKeyInput{}
+		if err := p.PoposkInput.unmarshalInner(&sub); err != nil {
+			return err
+		}
+	}
+
+	if err := p.Algorithm.unmarshal(seq); err != nil {
+		return err
+	}
+
+	var bitString cryptobyte.String
+	if !seq.ReadASN1(&bitString, cbasn1.BIT_STRING) {
+		return errors.New("pkicmp: invalid signature BIT STRING")
+	}
+	var unused uint8
+	if !bitString.ReadUint8(&unused) {
+		return errors.New("pkicmp: invalid signature unused bits")
+	}
+	p.Signature = bitString
+	return nil
+}
+
+// POPOSigningKeyInput per RFC 4211 §4.1.
+//
+//	POPOSigningKeyInput ::= SEQUENCE {
+//	    authInfo            CHOICE {
+//	        sender              [0] GeneralName,
+//	        publicKeyMAC        PKMACValue },
+//	    publicKey           SubjectPublicKeyInfo
+//	}
+type POPOSigningKeyInput struct {
+	// Sender optionally identifies who produced the POP signature.
+	Sender *GeneralName
+	// PublicKey is the key material being proven.
+	PublicKey []byte // Raw DER SubjectPublicKeyInfo
+}
+
+func (p *POPOSigningKeyInput) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
+	b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+		p.marshalInner(mctx, b)
+	})
+}
+
+func (p *POPOSigningKeyInput) marshalInner(mctx *MarshalContext, b *cryptobyte.Builder) {
+	if p.Sender != nil {
+		// sender [0] GeneralName (EXPLICIT because GeneralName is a CHOICE)
+		b.AddASN1(cbasn1.Tag(0).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+			p.Sender.marshal(mctx, b)
+		})
+	}
+	// publicKeyMAC not implemented for Phase 1
+	b.AddBytes(p.PublicKey)
+}
+
+func (p *POPOSigningKeyInput) unmarshal(s *cryptobyte.String) error {
+	var seq cryptobyte.String
+	if !s.ReadASN1(&seq, cbasn1.SEQUENCE) {
+		return errors.New("pkicmp: invalid POPOSigningKeyInput sequence")
+	}
+	return p.unmarshalInner(&seq)
+}
+
+func (p *POPOSigningKeyInput) unmarshalInner(seq *cryptobyte.String) error {
+	if !seq.Empty() {
+		tag := cbasn1.Tag((*seq)[0])
+		if tag == cbasn1.Tag(0).ContextSpecific().Constructed() {
+			var sub cryptobyte.String
+			if !seq.ReadASN1(&sub, tag) {
+				return errors.New("pkicmp: invalid sender tag")
+			}
+			p.Sender = &GeneralName{}
+			if err := p.Sender.unmarshal(&sub); err != nil {
+				return err
+			}
+		}
+	}
+
+	var pub cryptobyte.String
+	var pubTag cbasn1.Tag
+	if !seq.ReadAnyASN1Element(&pub, &pubTag) {
+		return errors.New("pkicmp: missing publicKey")
+	}
+	p.PublicKey = pub
+	return nil
+}

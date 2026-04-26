@@ -1,0 +1,32 @@
+services:
+  ejbca:
+    image: keyfactor/ejbca-ce:9.3.7
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    environment:
+      - TLS_SETUP_ENABLED=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-k", "https://localhost:8443/ejbca/publicweb/healthcheck/ejbcahealth"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+  # nginx can be used to access the EJBCA web interface without loading superadmin credentials to the browser.
+  # nginx is not started automatically. Start it manually on demand with:
+  #   docker compose -f test/integration/ejbca/docker-compose.yml --profile nginx up -d nginx
+  # then access the EJBCA web interface at http://localhost:8081/ejbca/adminweb/
+  nginx:
+    profiles:
+      - nginx
+    image: nginx:1.30.0-alpine3.23
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./testdata/superadmin-cert.pem:/certs/superadmin-cert.pem:ro
+      - ./testdata/superadmin-key.pem:/certs/superadmin-key.pem:ro
+    depends_on:
+      ejbca:
+        condition: service_healthy

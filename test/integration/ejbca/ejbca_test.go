@@ -1,0 +1,757 @@
+//go:build integration
+
+package ejbca
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
+	"errors"
+	"fmt"
+	"slices"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/tsaarni/go-pkicmp/client"
+	"github.com/tsaarni/go-pkicmp/pkicmp"
+)
+
+func TestEJBCAInitializeECDSA(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-ee"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	// EJBCA responds with signature protection even for PBM requests,
+	// so WithTrustedCAs is needed to verify the response signature.
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	result, err := c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.NoError(t, err, "SendIR")
+	require.NotNil(t, result.Certificate, "no certificate returned")
+
+	t.Logf("Issued certificate: %s (serial: %s)", result.Certificate.Subject, result.Certificate.SerialNumber)
+}
+
+func TestEJBCAInitializeECDSAP384(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-p384"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	result, err := c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.NoError(t, err, "SendIR")
+
+	cert := result.Certificate
+	require.NotNil(t, cert, "no certificate returned")
+
+	// Verify the public key in the cert matches the key we submitted.
+	certPubKey, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	require.True(t, ok, "certificate public key is not ECDSA")
+	assert.True(t, certPubKey.Equal(key.Public()), "certificate public key does not match the submitted key")
+
+	// Verify the certificate is signed by the CA.
+	_, err = cert.Verify(x509.VerifyOptions{Roots: admin.TrustedCAs(), KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}})
+	assert.NoError(t, err, "certificate verification against CA")
+
+	t.Logf("Issued certificate: %s (serial: %s)", cert.Subject, cert.SerialNumber)
+}
+
+func TestEJBCAInitializeRSA(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-rsa"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	result, err := c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.NoError(t, err, "SendIR")
+
+	cert := result.Certificate
+	require.NotNil(t, cert, "no certificate returned")
+
+	// Verify the public key in the cert matches the key we submitted.
+	certPubKey, ok := cert.PublicKey.(*rsa.PublicKey)
+	require.True(t, ok, "certificate public key is not RSA")
+	assert.True(t, certPubKey.Equal(key.Public()), "certificate public key does not match the submitted key")
+
+	// Verify the certificate is signed by the CA.
+	_, err = cert.Verify(x509.VerifyOptions{Roots: admin.TrustedCAs(), KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}})
+	assert.NoError(t, err, "certificate verification against CA")
+
+	t.Logf("Issued certificate: %s (serial: %s)", cert.Subject, cert.SerialNumber)
+}
+
+func TestEJBCAInitializeVerifyCertificateFields(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-verify-fields"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	result, err := c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.NoError(t, err, "SendIR")
+
+	cert := result.Certificate
+	require.NotNil(t, cert, "no certificate returned")
+
+	// Verify subject matches request.
+	assert.Equal(t, name, cert.Subject.CommonName, "subject CN")
+
+	// Verify issuer matches the CA.
+	assert.Equal(t, admin.CACert.Subject.CommonName, cert.Issuer.CommonName, "issuer CN")
+
+	// Verify the public key in the cert matches the key we submitted.
+	certPubKey, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	require.True(t, ok, "certificate public key is not ECDSA")
+	assert.True(t, certPubKey.Equal(key.Public()), "certificate public key does not match the submitted key")
+
+	// Verify the certificate is signed by the CA
+	_, err = cert.Verify(x509.VerifyOptions{Roots: admin.TrustedCAs(), KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}})
+	assert.NoError(t, err, "certificate verification against CA")
+
+	t.Logf("Certificate verified: %s (serial: %s, issuer: %s)", cert.Subject, cert.SerialNumber, cert.Issuer)
+}
+
+func TestEJBCAInitializeWrongSecret(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-wrong-secret"
+	correctSecret := "enrollment-secret"
+	wrongSecret := "wrong-secret"
+	admin.CreateEndEntity(t, name, correctSecret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(wrongSecret))
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	_, err = c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.Error(t, err, "SendIR with wrong secret should have failed")
+
+	var statusErr *pkicmp.PKIStatusError
+	require.True(t, errors.As(err, &statusErr), "error should be *pkicmp.PKIStatusError, got %T: %v", err, err)
+	assert.Equal(t, pkicmp.StatusRejection, statusErr.Status, "status should indicate rejection")
+	assert.True(t, statusErr.FailInfo&pkicmp.FailBadRequest != 0, "failInfo should indicate bad request")
+	assert.Contains(t, statusErr.StatusString, "Error while reading a certificate from the extraCert field", "status string should indicate MAC/shared-secret failure")
+
+	t.Logf("Expected error: %v", err)
+}
+
+func TestEJBCAInitializeWithExtensionOverride(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-ext-override"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	// Use a custom OID extension to verify that CertTemplate.Extensions works.
+	customOID := asn1.ObjectIdentifier{1, 2, 3, 4, 5}
+	customValue, err := asn1.Marshal("hello-extension-override")
+	require.NoError(t, err)
+
+	customExt := pkix.Extension{
+		Id:    customOID,
+		Value: customValue,
+	}
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	result, err := c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+		client.WithTemplateExtension(customExt),
+	)
+	require.NoError(t, err, "SendIR")
+
+	cert := result.Certificate
+	require.NotNil(t, cert, "no certificate returned")
+
+	// Verify the custom extension was honoured by the CA.
+	found := slices.ContainsFunc(cert.Extensions, func(ext pkix.Extension) bool {
+		return ext.Id.Equal(customOID)
+	})
+	assert.True(t, found, "certificate should contain the custom extension we added in the request")
+
+	t.Logf("Issued certificate: %s (serial: %s, extensions: %v)", cert.Subject, cert.SerialNumber, cert.Extensions)
+}
+
+func TestEJBCAInitializeContextCancellation(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-cancel"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately.
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+	)
+	_, err = c.SendIR(ctx, key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.Error(t, err, "SendIR with cancelled context should have failed")
+
+	t.Logf("Expected error: %v", err)
+}
+
+func TestEJBCAMultipleSequentialEnrollments(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	serials := make(map[string]bool)
+
+	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("integration-test-seq-%d", i)
+		secret := "enrollment-secret"
+		admin.CreateEndEntity(t, name, secret)
+
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+
+		protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+		require.NoError(t, err)
+
+		c := client.NewClient(admin.Endpoint,
+			client.WithRecipient(admin.CACert.Subject),
+			client.WithTrustedCAs(admin.TrustedCAs()),
+		)
+		result, err := c.SendIR(context.Background(), key, protector,
+			client.WithTemplateSubject(pkix.Name{CommonName: name}),
+		)
+		require.NoError(t, err, "SendIR %d", i)
+		require.NotNil(t, result.Certificate, "enrollment %d: no certificate returned", i)
+
+		serial := result.Certificate.SerialNumber.String()
+		require.False(t, serials[serial], "enrollment %d: duplicate serial number %s", i, serial)
+		serials[serial] = true
+
+		t.Logf("Enrollment %d: %s (serial: %s)", i, result.Certificate.Subject, serial)
+	}
+}
+
+func TestEJBCAInitializeInvalidEndpoint(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte("enrollment-secret"))
+	require.NoError(t, err)
+
+	c := client.NewClient("http://localhost:19999/nonexistent",
+		client.WithRecipient(admin.CACert.Subject),
+	)
+	_, err = c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: "integration-test-invalid-endpoint"}),
+	)
+	require.Error(t, err, "SendIR to invalid endpoint should have failed")
+
+	t.Logf("Expected error: %v", err)
+}
+
+func TestEJBCACertify(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-certify"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	// Step 1: Get an initial certificate via SendIR
+	initialKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	initialResult, err := c.SendIR(context.Background(), initialKey, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.NoError(t, err, "SendIR")
+
+	// Reset end entity status to NEW so EJBCA accepts the CR request.
+	admin.CreateEndEntity(t, name, secret)
+
+	// Step 2: Use the initial certificate to request a new one via SendCR.
+	newKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	sigProtector, err := pkicmp.NewSignatureProtector(initialKey, initialResult.Certificate)
+	require.NoError(t, err)
+
+	c = client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+		client.WithExtraCerts([]*x509.Certificate{initialResult.Certificate}),
+	)
+	result, err := c.SendCR(context.Background(), newKey, sigProtector,
+		client.WithSender(initialResult.Certificate.Subject),
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.NoError(t, err, "SendCR")
+	require.NotNil(t, result.Certificate, "no certificate returned")
+
+	t.Logf("Certified: %s (serial: %s)", result.Certificate.Subject, result.Certificate.SerialNumber)
+}
+
+func TestEJBCAKeyUpdate(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-kur"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	// Step 1: Get an initial certificate via SendIR
+	oldKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	initialResult, err := c.SendIR(context.Background(), oldKey, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.NoError(t, err, "SendIR")
+
+	// Step 2: Update the key.
+	newKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	sigProtector, err := pkicmp.NewSignatureProtector(oldKey, initialResult.Certificate)
+	require.NoError(t, err)
+
+	c = client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+		client.WithExtraCerts([]*x509.Certificate{initialResult.Certificate}),
+	)
+	result, err := c.SendKUR(context.Background(), newKey, sigProtector,
+		client.WithSender(initialResult.Certificate.Subject),
+		client.WithTemplateSubject(pkix.Name{CommonName: "integration-test-kur"}),
+	)
+	require.NoError(t, err, "SendKUR")
+	require.NotNil(t, result.Certificate, "no certificate returned")
+
+	assert.NotEqual(t, initialResult.Certificate.SerialNumber, result.Certificate.SerialNumber,
+		"SendKUR returned the same certificate serial — expected a new certificate")
+	oldCertPubKey, ok := initialResult.Certificate.PublicKey.(*ecdsa.PublicKey)
+	require.True(t, ok, "initial certificate public key is not ECDSA")
+	newCertPubKey, ok := result.Certificate.PublicKey.(*ecdsa.PublicKey)
+	require.True(t, ok, "updated certificate public key is not ECDSA")
+	assert.False(t, oldCertPubKey.Equal(newCertPubKey),
+		"public key should have changed after key update")
+
+	// Verify other certificate parameters remained the same.
+	assert.Equal(t, initialResult.Certificate.Subject, result.Certificate.Subject,
+		"subject should remain the same after key update")
+	assert.Equal(t, initialResult.Certificate.Issuer, result.Certificate.Issuer,
+		"issuer should remain the same after key update")
+	assert.Equal(t, initialResult.Certificate.SignatureAlgorithm, result.Certificate.SignatureAlgorithm,
+		"signature algorithm should remain the same after key update")
+	assert.Equal(t, initialResult.Certificate.PublicKeyAlgorithm, result.Certificate.PublicKeyAlgorithm,
+		"public key algorithm should remain the same after key update")
+	assert.Equal(t, initialResult.Certificate.KeyUsage, result.Certificate.KeyUsage,
+		"key usage should remain the same after key update")
+	assert.Equal(t, initialResult.Certificate.ExtKeyUsage, result.Certificate.ExtKeyUsage,
+		"extended key usage should remain the same after key update")
+
+	t.Logf("Updated: %s (serial: %s)", result.Certificate.Subject, result.Certificate.SerialNumber)
+}
+
+func TestEJBCAKeyUpdateWrongKey(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-kur-wrong-key"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	// Step 1: Get an initial certificate via SendIR.
+	oldKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	initialResult, err := c.SendIR(context.Background(), oldKey, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.NoError(t, err, "SendIR")
+
+	// Step 2: Attempt to update the key using a wrong (different) key for signing.
+	newKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	wrongOldKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	sigProtector, err := pkicmp.NewSignatureProtector(wrongOldKey, initialResult.Certificate)
+	require.NoError(t, err)
+
+	c = client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+		client.WithExtraCerts([]*x509.Certificate{initialResult.Certificate}),
+	)
+	_, err = c.SendKUR(context.Background(), newKey, sigProtector,
+		client.WithSender(initialResult.Certificate.Subject),
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.Error(t, err, "SendKUR with wrong key should have failed")
+
+	var statusErr *pkicmp.PKIStatusError
+	require.True(t, errors.As(err, &statusErr), "error should be *pkicmp.PKIStatusError")
+	assert.Equal(t, pkicmp.StatusRejection, statusErr.Status, "status should indicate rejection")
+	assert.True(t, statusErr.FailInfo&pkicmp.FailBadRequest != 0, "failInfo should indicate bad request")
+	assert.Contains(t, statusErr.StatusString, "Failed to verify the signature in the PKIMessage", "status string should indicate signature verification failure")
+
+	t.Logf("Expected error: %v", err)
+}
+
+func TestEJBCAInitializeP10CR(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-p10cr"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	// Create PKCS#10 CSR.
+	template := &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: name},
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, template, key)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	result, err := c.SendP10CR(context.Background(), csrDER, protector)
+	require.NoError(t, err, "SendP10CR")
+
+	cert := result.Certificate
+	require.NotNil(t, cert, "no certificate returned")
+
+	// Verify subject matches request.
+	assert.Equal(t, name, cert.Subject.CommonName, "subject CN")
+
+	// Verify the public key in the cert matches the key we submitted.
+	certPubKey, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	require.True(t, ok, "certificate public key is not ECDSA")
+	assert.True(t, certPubKey.Equal(key.Public()), "certificate public key does not match the submitted key")
+
+	// Verify the certificate is signed by the CA
+	_, err = cert.Verify(x509.VerifyOptions{Roots: admin.TrustedCAs(), KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}})
+	assert.NoError(t, err, "certificate verification against CA")
+
+	t.Logf("Issued certificate via P10CR: %s (serial: %s)", cert.Subject, cert.SerialNumber)
+}
+
+func TestEJBCAKeyUpdateSameKey(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-kur-same-key"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	// Step 1: Get an initial certificate via SendIR.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	initialResult, err := c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.NoError(t, err, "SendIR")
+
+	// Step 2: Update using the same key.
+	sigProtector, err := pkicmp.NewSignatureProtector(key, initialResult.Certificate)
+	require.NoError(t, err)
+
+	c = client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+		client.WithExtraCerts([]*x509.Certificate{initialResult.Certificate}),
+	)
+	result, err := c.SendKUR(context.Background(), key, sigProtector,
+		client.WithSender(initialResult.Certificate.Subject),
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.NoError(t, err, "SendKUR")
+	require.NotNil(t, result.Certificate, "no certificate returned")
+
+	assert.NotEqual(t, initialResult.Certificate.SerialNumber, result.Certificate.SerialNumber,
+		"SendKUR returned the same certificate serial — expected a new certificate")
+
+	// Verify the public key is the same.
+	assert.True(t, initialResult.Certificate.PublicKey.(*ecdsa.PublicKey).Equal(result.Certificate.PublicKey),
+		"public key should be the same after key update with same key")
+
+	t.Logf("Updated (same key): %s (serial: %s)", result.Certificate.Subject, result.Certificate.SerialNumber)
+}
+
+func TestEJBCASubjectAltName(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-san"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	// Add SAN extension.
+	sanOID := asn1.ObjectIdentifier{2, 5, 29, 17}
+	// GeneralNames [0] GeneralName
+	// dNSName [2] IA5String
+	sanValue, err := asn1.Marshal([]asn1.RawValue{
+		{Tag: 2, Class: 2, Bytes: []byte("example.com")},
+		{Tag: 2, Class: 2, Bytes: []byte("test.example.com")},
+	})
+	require.NoError(t, err)
+
+	sanExt := pkix.Extension{
+		Id:    sanOID,
+		Value: sanValue,
+	}
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	result, err := c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+		client.WithTemplateExtension(sanExt),
+	)
+	require.NoError(t, err, "SendIR")
+
+	cert := result.Certificate
+	require.NotNil(t, cert, "no certificate returned")
+
+	assert.Contains(t, cert.DNSNames, "example.com")
+	assert.Contains(t, cert.DNSNames, "test.example.com")
+
+	t.Logf("Issued certificate with SAN: %s (DNS: %v)", cert.Subject, cert.DNSNames)
+}
+
+func TestEJBCAMultipleExtensions(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-multi-ext"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	// Extension 1: SAN
+	sanOID := asn1.ObjectIdentifier{2, 5, 29, 17}
+	sanValue, err := asn1.Marshal([]asn1.RawValue{{Tag: 2, Class: 2, Bytes: []byte("multi.example.com")}})
+	require.NoError(t, err)
+
+	// Extension 2: Custom OID
+	customOID := asn1.ObjectIdentifier{1, 2, 3, 4, 5, 6}
+	customValue, err := asn1.Marshal("multi-ext-test")
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	result, err := c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+		client.WithTemplateExtension(pkix.Extension{Id: sanOID, Value: sanValue}),
+		client.WithTemplateExtension(pkix.Extension{Id: customOID, Value: customValue}),
+	)
+	require.NoError(t, err, "SendIR")
+
+	cert := result.Certificate
+	require.NotNil(t, cert, "no certificate returned")
+
+	assert.Contains(t, cert.DNSNames, "multi.example.com")
+	foundCustom := slices.ContainsFunc(cert.Extensions, func(ext pkix.Extension) bool {
+		return ext.Id.Equal(customOID)
+	})
+	assert.True(t, foundCustom, "custom extension not found")
+
+	t.Logf("Issued certificate with multiple extensions: %s", cert.Subject)
+}
+
+func TestEJBCAChainVerification(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-chain"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	result, err := c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.NoError(t, err, "SendIR")
+
+	cert := result.Certificate
+	require.NotNil(t, cert, "no certificate returned")
+
+	// In signature protection mode, EJBCA should return the CA certificate in ExtraCertificates.
+	assert.NotEmpty(t, result.ExtraCertificates, "ExtraCertificates should not be empty")
+
+	roots := x509.NewCertPool()
+	for _, c := range result.ExtraCertificates {
+		roots.AddCert(c)
+	}
+
+	_, err = cert.Verify(x509.VerifyOptions{
+		Roots:     roots,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	})
+	assert.NoError(t, err, "verification using returned extra certs")
+
+	t.Logf("Chain verified using %d extra certificates", len(result.ExtraCertificates))
+}
+
+func TestEJBCALargeKeys(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	secret := "enrollment-secret"
+
+	t.Run("RSA-4096", func(t *testing.T) {
+		name := "integration-test-rsa4096"
+		admin.CreateEndEntity(t, name, secret)
+
+		key, err := rsa.GenerateKey(rand.Reader, 4096)
+		require.NoError(t, err)
+
+		protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+		require.NoError(t, err)
+
+		c := client.NewClient(admin.Endpoint,
+			client.WithRecipient(admin.CACert.Subject),
+			client.WithTrustedCAs(admin.TrustedCAs()),
+		)
+		result, err := c.SendIR(context.Background(), key, protector,
+			client.WithTemplateSubject(pkix.Name{CommonName: name}),
+		)
+		require.NoError(t, err, "SendIR RSA-4096")
+		require.NotNil(t, result.Certificate)
+		assert.Equal(t, 4096, result.Certificate.PublicKey.(*rsa.PublicKey).N.BitLen())
+	})
+
+	t.Run("ECDSA-P521", func(t *testing.T) {
+		name := "integration-test-p521"
+		admin.CreateEndEntity(t, name, secret)
+
+		key, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+		require.NoError(t, err)
+
+		protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+		require.NoError(t, err)
+
+		c := client.NewClient(admin.Endpoint,
+			client.WithRecipient(admin.CACert.Subject),
+			client.WithTrustedCAs(admin.TrustedCAs()),
+		)
+		result, err := c.SendIR(context.Background(), key, protector,
+			client.WithTemplateSubject(pkix.Name{CommonName: name}),
+		)
+		require.NoError(t, err, "SendIR P-521")
+		require.NotNil(t, result.Certificate)
+		assert.Equal(t, elliptic.P521(), result.Certificate.PublicKey.(*ecdsa.PublicKey).Curve)
+	})
+}
