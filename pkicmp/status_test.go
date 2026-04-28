@@ -1,6 +1,8 @@
 package pkicmp
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -83,6 +85,50 @@ func TestPKIStatusInfoAsError(t *testing.T) {
 		assert.Contains(t, err.Error(), "status rejection")
 		assert.Contains(t, err.Error(), "failInfo: badAlg")
 		assert.Contains(t, err.Error(), "details: test error")
+	})
+}
+
+func TestHasFailure(t *testing.T) {
+	errSingle := &PKIStatusError{
+		Status:   StatusRejection,
+		FailInfo: FailBadAlg,
+	}
+
+	errMulti := &PKIStatusError{
+		Status:   StatusRejection,
+		FailInfo: FailBadAlg | FailBadTime | FailBadRequest,
+	}
+
+	t.Run("SingleBit", func(t *testing.T) {
+		assert.True(t, HasFailure(errSingle, FailBadAlg))
+		assert.False(t, HasFailure(errSingle, FailBadTime))
+	})
+
+	t.Run("MultipleBits", func(t *testing.T) {
+		assert.True(t, HasFailure(errMulti, FailBadAlg))
+		assert.True(t, HasFailure(errMulti, FailBadTime))
+		assert.True(t, HasFailure(errMulti, FailBadRequest))
+		assert.False(t, HasFailure(errMulti, FailBadCertId))
+	})
+
+	t.Run("CombinationMask", func(t *testing.T) {
+		// errSingle has only FailBadAlg
+		// Checking for (FailBadAlg OR FailBadTime) should be true.
+		assert.True(t, HasFailure(errSingle, FailBadAlg|FailBadTime))
+
+		// errMulti has (FailBadAlg | FailBadTime | FailBadRequest)
+		// Checking for (FailBadCertId OR FailBadDataFormat) should be false.
+		assert.False(t, HasFailure(errMulti, FailBadCertId|FailBadDataFormat))
+	})
+
+	t.Run("WrappedError", func(t *testing.T) {
+		wrapped := fmt.Errorf("outer: %w", errSingle)
+		assert.True(t, HasFailure(wrapped, FailBadAlg))
+	})
+
+	t.Run("OtherError", func(t *testing.T) {
+		assert.False(t, HasFailure(errors.New("not a pki error"), FailBadAlg))
+		assert.False(t, HasFailure(nil, FailBadAlg))
 	})
 }
 

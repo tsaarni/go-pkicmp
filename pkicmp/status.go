@@ -84,6 +84,35 @@ func (s PKIStatus) String() string {
 //	   systemFailure          (25),
 //	   duplicateCertReq       (26)
 //	}
+// HasFailure returns true if the error is a *PKIStatusError (or wraps one)
+// and the specified failure bit is set in its FailInfo field.
+//
+// Example:
+//
+//	if pkicmp.HasFailure(err, pkicmp.FailBadAlg) { ... }
+func HasFailure(err error, info PKIFailureInfo) bool {
+	var statusErr *PKIStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.FailInfo&info != 0
+	}
+	return false
+}
+
+// PKIFailureInfo gives machine-readable reason bits for non-success cases.
+// It is a bitmask where each bit represents a specific failure condition
+// defined in RFC 9810 §5.2.3.
+//
+// Callers can check for specific failure bits using HasFailure(err, bit)
+// or by using bitwise AND on the FailInfo field of a PKIStatusError:
+//
+//	if err != nil {
+//	    var statusErr *pkicmp.PKIStatusError
+//	    if errors.As(err, &statusErr) {
+//	        if statusErr.FailInfo & pkicmp.FailBadAlg != 0 {
+//	            // Handle bad algorithm error
+//	        }
+//	    }
+//	}
 type PKIFailureInfo uint32
 
 const (
@@ -187,7 +216,8 @@ type PKIStatusError struct {
 	Status PKIStatus
 	// StatusString is a flattened message string for Go error usage.
 	StatusString string
-	// FailInfo preserves wire-level failure bits for callers.
+	// FailInfo is a bitmask of machine-readable reason bits for the failure.
+	// Callers can use bitwise AND with Fail* constants to check for specific conditions.
 	FailInfo PKIFailureInfo
 }
 
