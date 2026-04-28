@@ -729,3 +729,30 @@ func TestEJBCAInitializeWrongSubject(t *testing.T) {
 	assert.True(t, statusErr.FailInfo&pkicmp.FailIncorrectData != 0, "failInfo should indicate incorrect data")
 	assert.Contains(t, statusErr.StatusString, "Wrong username or password", "status string should indicate wrong username/password")
 }
+
+func TestEJBCAInitializeFailNoTrustedCAs(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-no-trust"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	// Omit client.WithTrustedCAs().
+	// Even though the request is PBM-protected, EJBCA responds with signature protection.
+	// The client requires trusted CAs to verify the signature on the response.
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+	)
+	_, err = c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: name}),
+	)
+	require.Error(t, err, "SendIR without trusted CAs should have failed verify response")
+	assert.EqualError(t, err, "cmp: verify response: signature-protected response requires trusted CAs: use WithTrustedCAs()")
+
+	t.Logf("Expected error: %v", err)
+}

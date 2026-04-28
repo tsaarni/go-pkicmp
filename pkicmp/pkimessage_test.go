@@ -213,5 +213,6 @@ func TestParseRejectsInvalidASN1Structure(t *testing.T) {
 
 		_, err := pkicmp.ParsePKIMessage(badDer)
 		require.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid PKIMessage sequence")
 	})
 }
