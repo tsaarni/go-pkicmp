@@ -22,33 +22,6 @@ import (
 	"github.com/tsaarni/go-pkicmp/pkicmp"
 )
 
-func TestEJBCAInitializeECDSA(t *testing.T) {
-	admin := newEJBCAAdminClient(t)
-	name := "integration-test-ee"
-	secret := "enrollment-secret"
-	admin.CreateEndEntity(t, name, secret)
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
-	require.NoError(t, err)
-
-	// EJBCA responds with signature protection even for PBM requests,
-	// so WithTrustedCAs is needed to verify the response signature.
-	c := client.NewClient(admin.Endpoint,
-		client.WithRecipient(admin.CACert.Subject),
-		client.WithTrustedCAs(admin.TrustedCAs()),
-	)
-	result, err := c.SendIR(context.Background(), key, protector,
-		client.WithTemplateSubject(pkix.Name{CommonName: name}),
-	)
-	require.NoError(t, err, "SendIR")
-	require.NotNil(t, result.Certificate, "no certificate returned")
-
-	t.Logf("Issued certificate: %s (serial: %s)", result.Certificate.Subject, result.Certificate.SerialNumber)
-}
-
 func TestEJBCAInitializeECDSAP384(t *testing.T) {
 	admin := newEJBCAAdminClient(t)
 	name := "integration-test-p384"
@@ -188,6 +161,7 @@ func TestEJBCAInitializeWrongSecret(t *testing.T) {
 	var statusErr *pkicmp.PKIStatusError
 	require.True(t, errors.As(err, &statusErr), "error should be *pkicmp.PKIStatusError, got %T: %v", err, err)
 	assert.Equal(t, pkicmp.StatusRejection, statusErr.Status, "status should indicate rejection")
+	t.Logf("Error: %v, FailInfo: %v, StatusString: %s", statusErr, statusErr.FailInfo, statusErr.StatusString)
 	assert.True(t, statusErr.FailInfo&pkicmp.FailBadRequest != 0, "failInfo should indicate bad request")
 	assert.Contains(t, statusErr.StatusString, "Error while reading a certificate from the extraCert field", "status string should indicate MAC/shared-secret failure")
 
@@ -359,9 +333,22 @@ func TestEJBCACertify(t *testing.T) {
 		client.WithTemplateSubject(pkix.Name{CommonName: name}),
 	)
 	require.NoError(t, err, "SendCR")
-	require.NotNil(t, result.Certificate, "no certificate returned")
 
-	t.Logf("Certified: %s (serial: %s)", result.Certificate.Subject, result.Certificate.SerialNumber)
+	cert := result.Certificate
+	require.NotNil(t, cert, "no certificate returned")
+
+	assert.NotEqual(t, initialResult.Certificate.SerialNumber, cert.SerialNumber, "SendCR returned the same certificate serial — expected a new certificate")
+
+	// Verify the public key in the cert matches the key we submitted.
+	certPubKey, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	require.True(t, ok, "certificate public key is not ECDSA")
+	assert.True(t, certPubKey.Equal(newKey.Public()), "certificate public key does not match the submitted key")
+
+	// Verify the certificate is signed by the CA.
+	_, err = cert.Verify(x509.VerifyOptions{Roots: admin.TrustedCAs(), KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}})
+	assert.NoError(t, err, "certificate verification against CA")
+
+	t.Logf("Certified: %s (serial: %s)", cert.Subject, cert.SerialNumber)
 }
 
 func TestEJBCAKeyUpdate(t *testing.T) {
@@ -477,6 +464,7 @@ func TestEJBCAKeyUpdateWrongKey(t *testing.T) {
 	var statusErr *pkicmp.PKIStatusError
 	require.True(t, errors.As(err, &statusErr), "error should be *pkicmp.PKIStatusError")
 	assert.Equal(t, pkicmp.StatusRejection, statusErr.Status, "status should indicate rejection")
+	t.Logf("Error: %v, FailInfo: %v, StatusString: %s", statusErr, statusErr.FailInfo, statusErr.StatusString)
 	assert.True(t, statusErr.FailInfo&pkicmp.FailBadRequest != 0, "failInfo should indicate bad request")
 	assert.Contains(t, statusErr.StatusString, "Failed to verify the signature in the PKIMessage", "status string should indicate signature verification failure")
 
@@ -575,52 +563,6 @@ func TestEJBCAKeyUpdateSameKey(t *testing.T) {
 	t.Logf("Updated (same key): %s (serial: %s)", result.Certificate.Subject, result.Certificate.SerialNumber)
 }
 
-func TestEJBCASubjectAltName(t *testing.T) {
-	admin := newEJBCAAdminClient(t)
-	name := "integration-test-san"
-	secret := "enrollment-secret"
-	admin.CreateEndEntity(t, name, secret)
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
-	require.NoError(t, err)
-
-	// Add SAN extension.
-	sanOID := asn1.ObjectIdentifier{2, 5, 29, 17}
-	// GeneralNames [0] GeneralName
-	// dNSName [2] IA5String
-	sanValue, err := asn1.Marshal([]asn1.RawValue{
-		{Tag: 2, Class: 2, Bytes: []byte("example.com")},
-		{Tag: 2, Class: 2, Bytes: []byte("test.example.com")},
-	})
-	require.NoError(t, err)
-
-	sanExt := pkix.Extension{
-		Id:    sanOID,
-		Value: sanValue,
-	}
-
-	c := client.NewClient(admin.Endpoint,
-		client.WithRecipient(admin.CACert.Subject),
-		client.WithTrustedCAs(admin.TrustedCAs()),
-	)
-	result, err := c.SendIR(context.Background(), key, protector,
-		client.WithTemplateSubject(pkix.Name{CommonName: name}),
-		client.WithTemplateExtension(sanExt),
-	)
-	require.NoError(t, err, "SendIR")
-
-	cert := result.Certificate
-	require.NotNil(t, cert, "no certificate returned")
-
-	assert.Contains(t, cert.DNSNames, "example.com")
-	assert.Contains(t, cert.DNSNames, "test.example.com")
-
-	t.Logf("Issued certificate with SAN: %s (DNS: %v)", cert.Subject, cert.DNSNames)
-}
-
 func TestEJBCAMultipleExtensions(t *testing.T) {
 	admin := newEJBCAAdminClient(t)
 	name := "integration-test-multi-ext"
@@ -635,7 +577,10 @@ func TestEJBCAMultipleExtensions(t *testing.T) {
 
 	// Extension 1: SAN
 	sanOID := asn1.ObjectIdentifier{2, 5, 29, 17}
-	sanValue, err := asn1.Marshal([]asn1.RawValue{{Tag: 2, Class: 2, Bytes: []byte("multi.example.com")}})
+	sanValue, err := asn1.Marshal([]asn1.RawValue{
+		{Tag: 2, Class: 2, Bytes: []byte("multi.example.com")},
+		{Tag: 2, Class: 2, Bytes: []byte("test.multi.example.com")},
+	})
 	require.NoError(t, err)
 
 	// Extension 2: Custom OID
@@ -658,6 +603,7 @@ func TestEJBCAMultipleExtensions(t *testing.T) {
 	require.NotNil(t, cert, "no certificate returned")
 
 	assert.Contains(t, cert.DNSNames, "multi.example.com")
+	assert.Contains(t, cert.DNSNames, "test.multi.example.com")
 	foundCustom := slices.ContainsFunc(cert.Extensions, func(ext pkix.Extension) bool {
 		return ext.Id.Equal(customOID)
 	})
@@ -754,4 +700,32 @@ func TestEJBCALargeKeys(t *testing.T) {
 		require.NotNil(t, result.Certificate)
 		assert.Equal(t, elliptic.P521(), result.Certificate.PublicKey.(*ecdsa.PublicKey).Curve)
 	})
+}
+
+func TestEJBCAInitializeWrongSubject(t *testing.T) {
+	admin := newEJBCAAdminClient(t)
+	name := "integration-test-subject-ok"
+	secret := "enrollment-secret"
+	admin.CreateEndEntity(t, name, secret)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte(secret))
+	require.NoError(t, err)
+
+	c := client.NewClient(admin.Endpoint,
+		client.WithRecipient(admin.CACert.Subject),
+		client.WithTrustedCAs(admin.TrustedCAs()),
+	)
+	_, err = c.SendIR(context.Background(), key, protector,
+		client.WithTemplateSubject(pkix.Name{CommonName: "integration-test-wrong-subject"}),
+	)
+	require.Error(t, err, "SendIR with wrong subject should have failed")
+
+	var statusErr *pkicmp.PKIStatusError
+	require.True(t, errors.As(err, &statusErr), "error should be *pkicmp.PKIStatusError")
+	assert.Equal(t, pkicmp.StatusRejection, statusErr.Status, "status should indicate rejection")
+	assert.True(t, statusErr.FailInfo&pkicmp.FailIncorrectData != 0, "failInfo should indicate incorrect data")
+	assert.Contains(t, statusErr.StatusString, "Wrong username or password", "status string should indicate wrong username/password")
 }

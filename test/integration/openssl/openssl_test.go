@@ -303,6 +303,12 @@ func TestOpenSSLDynamicPolling(t *testing.T) {
 	require.NoError(t, err, "SendIR with dynamic polling")
 	require.NotNil(t, result.Certificate)
 
+	assert.Equal(t, srv.RspCert.SerialNumber, result.Certificate.SerialNumber, "returned cert serial should match rsp_cert")
+
+	// Verify the certificate is signed by the test CA.
+	_, err = result.Certificate.Verify(x509.VerifyOptions{Roots: srv.TrustedCAs(), KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}})
+	assert.NoError(t, err, "certificate chain verification")
+
 	// It should have waited at least checkAfter seconds.
 	assert.GreaterOrEqual(t, elapsed, time.Duration(checkAfter)*time.Second, "client should have respected server's checkAfter")
 
@@ -412,4 +418,35 @@ func TestOpenSSLPermanentWaiting(t *testing.T) {
 	assert.ErrorIs(t, err, pkicmp.ErrWaiting)
 
 	t.Logf("Expected permanent waiting error: %v", err)
+}
+
+func TestOpenSSLInitializeP10CRWrongSecret(t *testing.T) {
+	srv := newOpenSSLCMPServer(t, opensslCMPServerOpts{
+		SrvRef:    "test-ref",
+		SrvSecret: "correct-secret",
+	})
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	// Create PKCS#10 CSR.
+	template := &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: "openssl-test-p10cr-wrong-secret"},
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, template, key)
+	require.NoError(t, err)
+
+	protector, err := pkicmp.NewDefaultPBMProtector([]byte("wrong-secret"))
+	require.NoError(t, err)
+
+	c := client.NewClient(srv.Endpoint,
+		client.WithRecipient(srv.CACert.Subject),
+		client.WithTrustedCAs(srv.TrustedCAs()),
+	)
+	_, err = c.SendP10CR(context.Background(), csrDER, protector)
+
+	require.Error(t, err, "SendP10CR with wrong secret should fail")
+	assert.Contains(t, err.Error(), "verify protection: pkicmp: PBM verification failed")
+
+	t.Logf("Expected error: %v", err)
 }
