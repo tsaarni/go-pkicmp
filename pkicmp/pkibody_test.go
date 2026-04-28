@@ -175,7 +175,7 @@ func TestPKIBodyGetters(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, e.PKIStatusInfo.Status, got.PKIStatusInfo.Status)
 	})
-	}
+}
 
 func TestPKIBodyGetterMismatches(t *testing.T) {
 	body, _ := NewPKIConfBody()
@@ -196,8 +196,8 @@ func TestPKIBodyGetterMismatches(t *testing.T) {
 func TestPKIBodyUnmarshalBodyContentErrors(t *testing.T) {
 	t.Run("InvalidInnerTag", func(t *testing.T) {
 		// BodyTypeIR (tag 0xa0) but content is NOT a sequence (e.g. it's a primitive context tag)
-		// 0x80 is primitive context-specific tag 0. 
-		der := []byte{0x80, 0x01, 0x01} 
+		// 0x80 is primitive context-specific tag 0.
+		der := []byte{0x80, 0x01, 0x01}
 		body := &PKIBody{Type: BodyTypeIR, Raw: der}
 		_, err := body.IR()
 		assert.Error(t, err)

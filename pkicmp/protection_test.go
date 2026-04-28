@@ -65,6 +65,11 @@ func TestPBMRoundTrip(t *testing.T) {
 	err = parsed.Verify(macVerifier)
 	assert.NoError(t, err)
 
+	// Verify that tampering with header bytes fails
+	parsed.RawHeader[len(parsed.RawHeader)-1] ^= 0xFF
+	err = parsed.Verify(macVerifier)
+	assert.Error(t, err, "verification must fail if header bytes are tampered")
+
 	// Verify with wrong secret fails
 	macVerifier.SetSharedSecret([]byte("wrong-secret"))
 	err = parsed.Verify(macVerifier)

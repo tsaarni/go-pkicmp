@@ -32,7 +32,6 @@ func TestCertReqMessagesASN1(t *testing.T) {
 			},
 		}
 
-
 		var b cryptobyte.Builder
 		m.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, &b)
 		marshaled, err := b.Bytes()
@@ -45,6 +44,7 @@ func TestCertReqMessagesASN1(t *testing.T) {
 
 		assert.Len(t, unmarshaled, 1)
 		assert.Equal(t, m[0].CertReq.CertReqID, unmarshaled[0].CertReq.CertReqID)
+		assert.Equal(t, m[0].CertReq.CertTemplate.Subject.DirectoryName, unmarshaled[0].CertReq.CertTemplate.Subject.DirectoryName)
 	})
 
 	t.Run("UnmarshalInvalid", func(t *testing.T) {

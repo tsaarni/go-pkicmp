@@ -84,6 +84,7 @@ func (s PKIStatus) String() string {
 //	   systemFailure          (25),
 //	   duplicateCertReq       (26)
 //	}
+//
 // HasFailure returns true if the error is a *PKIStatusError (or wraps one)
 // and the specified failure bit is set in its FailInfo field.
 //

@@ -351,13 +351,22 @@ func TestPKIMessagePVNOTigger(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, PVNO2, parsed.Header.PVNO)
 	})
-	t.Run("PVNO3", func(t *testing.T) {
-		// CertConf with HashAlg triggers PVNO3
-		conf := &CertConfirmContent{{
-			CertHash: []byte{0x01},
-			HashAlg:  &AlgorithmIdentifier{Algorithm: OIDSHA256},
-		}}
-		body, _ := NewCertConfBody(conf)
+	t.Run("PVNO3_EnvelopedData", func(t *testing.T) {
+		// EncryptedKey with EnvelopedData triggers PVNO3
+		resp := &CertResponse{
+			CertReqID: 1,
+			Status:    PKIStatusInfo{Status: StatusAccepted},
+			CertifiedKeyPair: &CertifiedKeyPair{
+				CertOrEncCert: CertOrEncCert{
+					EncryptedCert: &EncryptedKey{
+						EnvelopedData: &EnvelopedData{Raw: []byte{0x30, 0x03, 0x02, 0x01, 0x01}},
+					},
+				},
+			},
+		}
+		body, _ := NewCPBody(&CertRepMessage{
+			Response: []CertResponse{*resp},
+		})
 		msg := &PKIMessage{
 			Header: PKIHeader{
 				Sender:    NewDirectoryName(nil),

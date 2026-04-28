@@ -33,8 +33,10 @@ func TestCertRepMessageASN1(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.Len(t, unmarshaled.CAPubs, 1)
+		assert.Equal(t, m.CAPubs[0].Raw, unmarshaled.CAPubs[0].Raw)
 		assert.Len(t, unmarshaled.Response, 1)
 		assert.Equal(t, m.Response[0].CertReqID, unmarshaled.Response[0].CertReqID)
+		assert.Equal(t, m.Response[0].Status.Status, unmarshaled.Response[0].Status.Status)
 	})
 
 	t.Run("UnmarshalInvalid", func(t *testing.T) {
@@ -96,7 +98,9 @@ func TestCertResponseASN1(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.Equal(t, resp.CertReqID, unmarshaled.CertReqID)
+		assert.Equal(t, resp.Status.Status, unmarshaled.Status.Status)
 		assert.NotNil(t, unmarshaled.CertifiedKeyPair)
+		assert.Equal(t, resp.CertifiedKeyPair.CertOrEncCert.Certificate.Raw, unmarshaled.CertifiedKeyPair.CertOrEncCert.Certificate.Raw)
 		assert.Equal(t, resp.RspInfo, unmarshaled.RspInfo)
 	})
 
