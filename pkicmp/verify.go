@@ -34,6 +34,13 @@ type VerifyOptions struct {
 	// if only MAC verification is needed.
 	TrustPool *x509.CertPool
 
+	// TrustedCert is a pre-trusted certificate for verifying signature-protected
+	// messages. When set, the signature is verified directly against this
+	// certificate without chain validation. This is used when the verifier has
+	// already resolved the sender's certificate from its own database.
+	// Takes precedence over TrustPool/ExtraCerts.
+	TrustedCert *x509.Certificate
+
 	// ExtraCerts provides candidate signer certificates (typically from
 	// msg.ExtraCerts) for signature chain building.
 	ExtraCerts []CMPCertificate
@@ -73,7 +80,7 @@ func (m *PKIMessage) Verify(opts VerifyOptions) (*VerifyResult, error) {
 	if alg.Equal(OIDPasswordBasedMac) {
 		return m.verifyPBM(opts)
 	}
-	if _, err := sigAlgFromOID(alg); err == nil {
+	if _, err := SigAlgFromOID(alg); err == nil {
 		return m.verifySignature(opts)
 	}
 
@@ -143,11 +150,7 @@ func (m *PKIMessage) verifyPBM(opts VerifyOptions) (*VerifyResult, error) {
 // RFC 9810 §8.9: The message sender MUST be authenticated with existing
 // trust anchors.
 func (m *PKIMessage) verifySignature(opts VerifyOptions) (*VerifyResult, error) {
-	if opts.TrustPool == nil {
-		return nil, &VerificationError{Reason: ReasonMissingTrustAnchors}
-	}
-
-	sigAlg, err := sigAlgFromOID(m.Header.ProtectionAlg.Algorithm)
+	sigAlg, err := SigAlgFromOID(m.Header.ProtectionAlg.Algorithm)
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +158,19 @@ func (m *PKIMessage) verifySignature(opts VerifyOptions) (*VerifyResult, error) 
 	data, err := m.protectedPart()
 	if err != nil {
 		return nil, err
+	}
+
+	// Direct verification against a pre-trusted certificate (server-side lookup).
+	if opts.TrustedCert != nil {
+		if err := opts.TrustedCert.CheckSignature(sigAlg, data, m.Protection); err != nil {
+			return nil, &VerificationError{Reason: ReasonSignatureFailed}
+		}
+		return &VerifyResult{MACVerified: false}, nil
+	}
+
+	// Chain-based verification using TrustPool and ExtraCerts.
+	if opts.TrustPool == nil {
+		return nil, &VerificationError{Reason: ReasonMissingTrustAnchors}
 	}
 
 	// Build intermediates pool from ExtraCerts for chain verification.

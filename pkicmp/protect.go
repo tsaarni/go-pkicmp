@@ -156,8 +156,8 @@ func (m *PKIMessage) ProtectWithSignature(key crypto.Signer, cert *x509.Certific
 		return err
 	}
 
-	sigAlg, _ := sigAlgFromOID(sigAlgOID)
-	hash := hashFromSigAlg(sigAlg)
+	sigAlg, _ := SigAlgFromOID(sigAlgOID)
+	hash := HashFromSigAlg(sigAlg)
 
 	var opts crypto.SignerOpts
 	var digest []byte

@@ -134,6 +134,9 @@ type CertRequest struct {
 	CertReqID int64
 	// CertTemplate describes subject, key, and extension preferences.
 	CertTemplate CertTemplate
+	// Raw contains the DER encoding of this CertRequest, preserved during parsing
+	// for use in POP verification. Set automatically by unmarshal; ignored during marshal.
+	Raw []byte
 }
 
 func (r *CertRequest) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
@@ -144,8 +147,16 @@ func (r *CertRequest) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
 }
 
 func (r *CertRequest) unmarshal(s *cryptobyte.String) error {
+	// Capture the raw DER of the entire CertRequest SEQUENCE for POP verification.
+	var raw cryptobyte.String
+	if !s.ReadASN1Element(&raw, cbasn1.SEQUENCE) {
+		return &ParseError{Detail: "invalid CertRequest sequence"}
+	}
+	r.Raw = []byte(raw)
+
 	var seq cryptobyte.String
-	if !s.ReadASN1(&seq, cbasn1.SEQUENCE) {
+	inner := cryptobyte.String(r.Raw)
+	if !inner.ReadASN1(&seq, cbasn1.SEQUENCE) {
 		return &ParseError{Detail: "invalid CertRequest sequence"}
 	}
 	if !seq.ReadASN1Integer(&r.CertReqID) {
