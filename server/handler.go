@@ -2,79 +2,42 @@ package server
 
 import (
 	"context"
-	"crypto"
+	"crypto/sha256"
 	"crypto/x509"
-	"crypto/x509/pkix"
+	"errors"
 	"time"
 
 	"github.com/tsaarni/go-pkicmp/pkicmp"
 )
 
-// Handler processes CMP requests. Implement this to add CMP support to a CA or RA.
-//
-// The server package handles protocol mechanics: message parsing, protection verification,
-// POP validation, and RFC-mandated header checks. Policy decisions are the handler's
-// responsibility:
-//   - Whether to allow CA certificates (check Extensions for BasicConstraints with cA=true)
-//   - Authorization based on sender identity
-//   - Certificate profile validation
-//   - Rate limiting and other operational policies
-//
-// Use [HasCABasicConstraints] to check for CA certificate requests.
+// Handler processes CMP messages.
 type Handler interface {
-	// HandleCertRequest processes IR, CR, KUR, and P10CR requests.
-	// Called after the server has verified message protection, POP, and validated the header.
-	// Return an issued certificate, a WaitingResponse for polling, or an error.
-	HandleCertRequest(ctx context.Context, req *CertRequest) (*CertResponse, error)
-
-	// HandleCertConfirm is called when the client confirms or rejects a certificate.
-	// RFC 9810 §5.3.18: omission of a CertStatus means rejection.
-	// The server automatically responds with PKIConf after this returns.
-	HandleCertConfirm(ctx context.Context, confirm *CertConfirmation) error
-
-	// HandlePollRequest is called when the client polls for a pending certificate.
-	// Return the certificate if ready, or another WaitingResponse with updated checkAfter.
-	HandlePollRequest(ctx context.Context, poll *PollRequest) (*CertResponse, error)
+	HandleCMP(ctx context.Context, req *pkicmp.PKIMessage, sender *SenderIdentity) (*Response, error)
 }
 
-// RequestType identifies the CMP operation type.
-type RequestType int
+// HandlerFunc is an adapter to allow ordinary functions as Handlers.
+type HandlerFunc func(context.Context, *pkicmp.PKIMessage, *SenderIdentity) (*Response, error)
 
-const (
-	RequestIR    RequestType = 0 // Initialization Request
-	RequestCR    RequestType = 2 // Certification Request
-	RequestP10CR RequestType = 4 // PKCS#10 Certification Request
-	RequestKUR   RequestType = 7 // Key Update Request
-)
+func (f HandlerFunc) HandleCMP(ctx context.Context, req *pkicmp.PKIMessage, sender *SenderIdentity) (*Response, error) {
+	return f(ctx, req, sender)
+}
 
-// CertRequest is the parsed, verified enrollment request presented to the Handler.
-type CertRequest struct {
-	// Type identifies the CMP operation: IR, CR, KUR, or P10CR.
-	Type RequestType
+// Middleware wraps a Handler with additional behavior.
+type Middleware func(Handler) Handler
 
-	// Subject from the certificate template (CRMF) or CSR (P10CR).
-	Subject pkix.Name
+// Chain applies middleware in order. First middleware is outermost.
+func Chain(h Handler, mw ...Middleware) Handler {
+	for i := len(mw) - 1; i >= 0; i-- {
+		h = mw[i](h)
+	}
+	return h
+}
 
-	// PublicKey is the requester's public key to be certified.
-	PublicKey crypto.PublicKey
-
-	// Extensions requested (SANs, key usage, etc.)
-	Extensions []pkix.Extension
-
-	// CertReqID from the CRMF request (always -1 for P10CR per RFC 9810 §5.3.4).
-	CertReqID int64
-
-	// Sender is the verified identity from message protection.
-	Sender *SenderIdentity
-
-	// TransactionID identifies this enrollment transaction.
-	TransactionID []byte
-
-	// CertProfile from the generalInfo header field (RFC 9810 §5.1.1.4), if present.
-	CertProfile string
-
-	// Raw provides access to the full PKIMessage for advanced use cases.
-	Raw *pkicmp.PKIMessage
+// Response is what the Handler returns.
+type Response struct {
+	Certificate *x509.Certificate
+	CACerts     []*x509.Certificate
+	Waiting     *WaitingResponse
 }
 
 // SenderIdentity represents the authenticated message sender.
@@ -87,38 +50,33 @@ type SenderIdentity struct {
 	MACVerified bool
 }
 
-// CertResponse is what the Handler returns.
-type CertResponse struct {
-	// Certificate is the issued certificate. Mutually exclusive with Waiting.
-	Certificate *x509.Certificate
-	// CACerts for the caPubs field (RFC 9810 §5.3.4).
-	CACerts []*x509.Certificate
-	// Waiting signals the CA needs more time. Triggers polling.
-	Waiting *WaitingResponse
+// CredentialID returns a hash identifying the credentials used for protection.
+// Used to verify that follow-up messages use the same credentials per RFC 9483 §3.2.
+func (s *SenderIdentity) CredentialID() ([]byte, error) {
+	h := sha256.New()
+	if s.MACVerified {
+		h.Write(s.SenderKID)
+	} else if s.Certificate != nil {
+		h.Write(s.Certificate.Raw)
+	} else {
+		return nil, errors.New("no credentials in SenderIdentity")
+	}
+	return h.Sum(nil), nil
 }
 
 // WaitingResponse tells the server to respond with "waiting" status.
 type WaitingResponse struct {
 	CheckAfter time.Duration
 	Reason     string
+	PollRef    string // Opaque reference for CA to identify pending request on poll
 }
 
-// PollRequest is presented when the client polls for a pending certificate.
-type PollRequest struct {
-	TransactionID   []byte
-	CertReqID       int64
-	OriginalRequest RequestType // The request type that started this transaction
-	Sender          *SenderIdentity
-	Raw             *pkicmp.PKIMessage
-}
+// RequestType identifies the CMP operation type.
+type RequestType int
 
-// CertConfirmation is presented when the client sends certConf.
-type CertConfirmation struct {
-	TransactionID []byte
-	Sender        *SenderIdentity
-	// Accepted contains CertReqIDs that the client confirmed.
-	Accepted []int64
-	// Rejected contains CertReqIDs that the client rejected.
-	Rejected []int64
-	Raw      *pkicmp.PKIMessage
-}
+const (
+	RequestIR    RequestType = 0 // Initialization Request
+	RequestCR    RequestType = 2 // Certification Request
+	RequestP10CR RequestType = 4 // PKCS#10 Certification Request
+	RequestKUR   RequestType = 7 // Key Update Request
+)

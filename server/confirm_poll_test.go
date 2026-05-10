@@ -30,15 +30,15 @@ func TestPolling(t *testing.T) {
 
 	pollCount := 0
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			return &server.CertResponse{
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			return &certResponse{
 				Waiting: &server.WaitingResponse{CheckAfter: 1 * time.Second, Reason: "processing"},
 			}, nil
 		},
-		handlePollRequest: func(ctx context.Context, poll *server.PollRequest) (*server.CertResponse, error) {
+		handlePollRequest: func(ctx context.Context, poll *pollRequest) (*certResponse, error) {
 			pollCount++
 			if pollCount < 2 {
-				return &server.CertResponse{
+				return &certResponse{
 					Waiting: &server.WaitingResponse{CheckAfter: 0},
 				}, nil
 			}
@@ -54,7 +54,7 @@ func TestPolling(t *testing.T) {
 			pub, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 			certDER, _ := x509.CreateCertificate(rand.Reader, tmpl, &caCertX509, &pub.PublicKey, caKey)
 			cert, _ := x509.ParseCertificate(certDER)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -82,11 +82,11 @@ func TestCertConf(t *testing.T) {
 
 	var confirmCalled bool
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
-		handleCertConfirm: func(ctx context.Context, confirm *server.CertConfirmation) error {
+		handleCertConfirm: func(ctx context.Context, confirm *certConfirmation) error {
 			confirmCalled = true
 			assert.NotEmpty(t, confirm.Accepted)
 			return nil
@@ -116,11 +116,11 @@ func TestCertConfRejection(t *testing.T) {
 
 	var confirmCalled bool
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
-		handleCertConfirm: func(ctx context.Context, confirm *server.CertConfirmation) error {
+		handleCertConfirm: func(ctx context.Context, confirm *certConfirmation) error {
 			confirmCalled = true
 			assert.NotEmpty(t, confirm.Rejected)
 			return nil
@@ -177,11 +177,11 @@ func TestCertConfWithBadHash(t *testing.T) {
 
 	var confirmCalled bool
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
-		handleCertConfirm: func(ctx context.Context, confirm *server.CertConfirmation) error {
+		handleCertConfirm: func(ctx context.Context, confirm *certConfirmation) error {
 			confirmCalled = true
 			assert.NotEmpty(t, confirm.Rejected)
 			return nil
@@ -230,8 +230,13 @@ func TestCertConfWithBadHash(t *testing.T) {
 	n2, _ := resp2.Body.Read(buf2[:])
 	resp2.Body.Close()
 	confResp, _ := pkicmp.ParsePKIMessage(buf2[:n2])
-	assert.Equal(t, pkicmp.BodyTypePKIConf, confResp.Body.Type)
-	assert.True(t, confirmCalled)
+
+	// Server should reject certConf with bad hash.
+	assert.Equal(t, pkicmp.BodyTypeError, confResp.Body.Type)
+	errContent, _ := confResp.Body.Error()
+	assert.Equal(t, pkicmp.StatusRejection, errContent.PKIStatusInfo.Status)
+	assert.NotZero(t, errContent.PKIStatusInfo.FailInfo&pkicmp.FailBadCertId)
+	assert.False(t, confirmCalled)
 }
 
 func TestCertConfWithRejectionStatus(t *testing.T) {
@@ -241,11 +246,11 @@ func TestCertConfWithRejectionStatus(t *testing.T) {
 
 	var confirmCalled bool
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
-		handleCertConfirm: func(ctx context.Context, confirm *server.CertConfirmation) error {
+		handleCertConfirm: func(ctx context.Context, confirm *certConfirmation) error {
 			confirmCalled = true
 			assert.NotEmpty(t, confirm.Rejected)
 			return nil
@@ -311,12 +316,12 @@ func TestPollRequestHandlerError(t *testing.T) {
 	secret := []byte("poll-err-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			return &server.CertResponse{
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			return &certResponse{
 				Waiting: &server.WaitingResponse{CheckAfter: 0},
 			}, nil
 		},
-		handlePollRequest: func(ctx context.Context, poll *server.PollRequest) (*server.CertResponse, error) {
+		handlePollRequest: func(ctx context.Context, poll *pollRequest) (*certResponse, error) {
 			return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailSystemFailure, StatusText: "poll failed"}
 		},
 	}
@@ -340,8 +345,8 @@ func TestPollReqWithoutPriorRequest(t *testing.T) {
 	secret := []byte("poll-no-prior")
 
 	handler := &mockHandler{
-		handlePollRequest: func(ctx context.Context, poll *server.PollRequest) (*server.CertResponse, error) {
-			assert.Equal(t, server.RequestType(0), poll.OriginalRequest)
+		handlePollRequest: func(ctx context.Context, poll *pollRequest) (*certResponse, error) {
+			assert.Equal(t, requestType(0), poll.OriginalRequest)
 			return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadRequest}
 		},
 	}
@@ -369,12 +374,12 @@ func TestPollReqEmptyContent(t *testing.T) {
 	secret := []byte("poll-empty")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			return &server.CertResponse{
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			return &certResponse{
 				Waiting: &server.WaitingResponse{CheckAfter: 0},
 			}, nil
 		},
-		handlePollRequest: func(ctx context.Context, poll *server.PollRequest) (*server.CertResponse, error) {
+		handlePollRequest: func(ctx context.Context, poll *pollRequest) (*certResponse, error) {
 			assert.Equal(t, int64(0), poll.CertReqID)
 			return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadRequest}
 		},
@@ -403,13 +408,13 @@ func TestPollReqWithReason(t *testing.T) {
 	secret := []byte("poll-reason")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			return &server.CertResponse{
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			return &certResponse{
 				Waiting: &server.WaitingResponse{CheckAfter: 1 * time.Second, Reason: "manual approval needed"},
 			}, nil
 		},
-		handlePollRequest: func(ctx context.Context, poll *server.PollRequest) (*server.CertResponse, error) {
-			return &server.CertResponse{
+		handlePollRequest: func(ctx context.Context, poll *pollRequest) (*certResponse, error) {
+			return &certResponse{
 				Waiting: &server.WaitingResponse{CheckAfter: 2 * time.Second, Reason: "still waiting"},
 			}, nil
 		},
@@ -459,12 +464,12 @@ func TestPollReqWithCertReady(t *testing.T) {
 	secret := []byte("poll-ready")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			return &server.CertResponse{
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			return &certResponse{
 				Waiting: &server.WaitingResponse{CheckAfter: 0},
 			}, nil
 		},
-		handlePollRequest: func(ctx context.Context, poll *server.PollRequest) (*server.CertResponse, error) {
+		handlePollRequest: func(ctx context.Context, poll *pollRequest) (*certResponse, error) {
 			serial, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
 			caCertX509, _ := ca.X509Certificate()
 			caKey, _ := ca.PrivateKey()
@@ -477,7 +482,7 @@ func TestPollReqWithCertReady(t *testing.T) {
 			pub, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 			certDER, _ := x509.CreateCertificate(rand.Reader, tmpl, &caCertX509, &pub.PublicKey, caKey)
 			cert, _ := x509.ParseCertificate(certDER)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -495,4 +500,154 @@ func TestPollReqWithCertReady(t *testing.T) {
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "poll-ready-cert", result.Certificate.Subject.CommonName)
+}
+
+func TestCertConfWithDifferentCredentials(t *testing.T) {
+	ca := &certyaml.Certificate{Subject: "CN=Test CA"}
+	caCert, _ := ca.X509Certificate()
+	secret1 := []byte("secret-1")
+	secret2 := []byte("secret-2")
+
+	handler := &mockHandler{
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			cert := issueCert(ca, req)
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+		},
+	}
+
+	// Server accepts both secrets.
+	srv := server.New(handler, server.WithSecretLookup(&multiMACLookup{
+		secrets: map[string][]byte{"kid1": secret1, "kid2": secret2},
+	}))
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// Send IR with secret1.
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	pubDER, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	certReqMsg := pkicmp.CertReqMsg{
+		CertReq: pkicmp.CertRequest{
+			CertReqID: 0,
+			CertTemplate: pkicmp.CertTemplate{
+				Subject:   pkicmp.NewDirectoryName(pkix.Name{CommonName: "test"}.ToRDNSequence()),
+				PublicKey: pubDER,
+			},
+		},
+	}
+	_ = certReqMsg.GeneratePOP(key)
+	msg := pkicmp.NewPKIMessage(pkicmp.NewIRBody(&pkicmp.CertReqMessages{certReqMsg}), pkicmp.MessageOptions{
+		Sender:    pkicmp.NewDirectoryName(pkix.Name{CommonName: "kid1"}.ToRDNSequence()),
+		Recipient: pkicmp.NewDirectoryName(pkix.Name{CommonName: "Test CA"}.ToRDNSequence()),
+	})
+	msg.Header.SenderKID = []byte("kid1")
+	_ = msg.ProtectWithMAC(secret1)
+	msgDER, _ := msg.MarshalBinary()
+
+	resp, _ := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
+	var buf [65536]byte
+	n, _ := resp.Body.Read(buf[:])
+	resp.Body.Close()
+	respMsg, _ := pkicmp.ParsePKIMessage(buf[:n])
+
+	// Send certConf with secret2 (different credentials) — should be rejected.
+	emptyConf := pkicmp.CertConfirmContent{}
+	confMsg := pkicmp.NewPKIMessage(pkicmp.NewCertConfBody(&emptyConf), pkicmp.MessageOptions{
+		Sender:    pkicmp.NewDirectoryName(pkix.Name{CommonName: "kid2"}.ToRDNSequence()),
+		Recipient: pkicmp.NewDirectoryName(pkix.Name{CommonName: "Test CA"}.ToRDNSequence()),
+	})
+	confMsg.Header.TransactionID = msg.Header.TransactionID
+	confMsg.Header.RecipNonce = respMsg.Header.SenderNonce
+	confMsg.Header.SenderKID = []byte("kid2")
+	_ = confMsg.ProtectWithMAC(secret2)
+	confDER, _ := confMsg.MarshalBinary()
+
+	resp2, _ := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(confDER)))
+	var buf2 [65536]byte
+	n2, _ := resp2.Body.Read(buf2[:])
+	resp2.Body.Close()
+	confResp, _ := pkicmp.ParsePKIMessage(buf2[:n2])
+
+	// RFC 9483 §3.2: certConf MUST use the same credentials — should be rejected.
+	// With composite key, different credentials means "unknown transaction".
+	assert.Equal(t, pkicmp.BodyTypeError, confResp.Body.Type)
+	errContent, _ := confResp.Body.Error()
+	assert.Equal(t, pkicmp.StatusRejection, errContent.PKIStatusInfo.Status)
+	assert.NotZero(t, errContent.PKIStatusInfo.FailInfo&pkicmp.FailBadRequest)
+}
+
+func TestPollReqWithDifferentCredentials(t *testing.T) {
+	secret1 := []byte("poll-secret-1")
+	secret2 := []byte("poll-secret-2")
+
+	handler := &mockHandler{
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			return &certResponse{
+				Waiting: &server.WaitingResponse{CheckAfter: 1 * time.Second},
+			}, nil
+		},
+	}
+
+	// Server accepts both secrets.
+	srv := server.New(handler, server.WithSecretLookup(&multiMACLookup{
+		secrets: map[string][]byte{"kid1": secret1, "kid2": secret2},
+	}))
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	// Send IR with secret1.
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	pubDER, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	msgs := pkicmp.CertReqMessages{
+		{CertReq: pkicmp.CertRequest{CertReqID: 0, CertTemplate: pkicmp.CertTemplate{PublicKey: pubDER}}},
+	}
+	msg := pkicmp.NewPKIMessage(pkicmp.NewIRBody(&msgs), pkicmp.MessageOptions{
+		Sender:    pkicmp.NewDirectoryName(pkix.Name{CommonName: "kid1"}.ToRDNSequence()),
+		Recipient: pkicmp.NewDirectoryName(pkix.Name{CommonName: "Test CA"}.ToRDNSequence()),
+	})
+	msg.Header.SenderKID = []byte("kid1")
+	_ = msg.ProtectWithMAC(secret1)
+	msgDER, _ := msg.MarshalBinary()
+
+	resp, _ := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
+	var buf [65536]byte
+	n, _ := resp.Body.Read(buf[:])
+	resp.Body.Close()
+	respMsg, _ := pkicmp.ParsePKIMessage(buf[:n])
+
+	// Send pollReq with secret2 (different credentials) — should be rejected.
+	pollReq := pkicmp.PollReqContent{0}
+	pollMsg := pkicmp.NewPKIMessage(pkicmp.NewPollReqBody(&pollReq), pkicmp.MessageOptions{
+		Sender:    pkicmp.NewDirectoryName(pkix.Name{CommonName: "kid2"}.ToRDNSequence()),
+		Recipient: pkicmp.NewDirectoryName(pkix.Name{CommonName: "Test CA"}.ToRDNSequence()),
+	})
+	pollMsg.Header.TransactionID = msg.Header.TransactionID
+	pollMsg.Header.RecipNonce = respMsg.Header.SenderNonce
+	pollMsg.Header.SenderKID = []byte("kid2")
+	_ = pollMsg.ProtectWithMAC(secret2)
+	pollDER, _ := pollMsg.MarshalBinary()
+
+	resp2, _ := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(pollDER)))
+	var buf2 [65536]byte
+	n2, _ := resp2.Body.Read(buf2[:])
+	resp2.Body.Close()
+	pollResp, _ := pkicmp.ParsePKIMessage(buf2[:n2])
+
+	// RFC 9483 §3.2: pollReq MUST use the same credentials — should be rejected.
+	// With composite key, different credentials means "no pending certificate".
+	assert.Equal(t, pkicmp.BodyTypeError, pollResp.Body.Type)
+	errContent, _ := pollResp.Body.Error()
+	assert.Equal(t, pkicmp.StatusRejection, errContent.PKIStatusInfo.Status)
+	assert.NotZero(t, errContent.PKIStatusInfo.FailInfo&pkicmp.FailBadRequest)
+}
+
+// multiMACLookup supports multiple secrets keyed by senderKID.
+type multiMACLookup struct {
+	secrets map[string][]byte
+}
+
+func (m *multiMACLookup) LookupSecret(senderKID []byte) ([]byte, error) {
+	if secret, ok := m.secrets[string(senderKID)]; ok {
+		return secret, nil
+	}
+	return nil, nil
 }

@@ -189,6 +189,21 @@ func (b *PKIBody) KUR() (*CertReqMessages, error) {
 	return b.kur, b.err
 }
 
+// CertReqMessages returns the CertReqMessages for IR, CR, or KUR body types.
+// This is a convenience method that dispatches to the appropriate getter.
+func (b *PKIBody) CertReqMessages() (*CertReqMessages, error) {
+	switch b.Type {
+	case BodyTypeIR:
+		return b.IR()
+	case BodyTypeCR:
+		return b.CR()
+	case BodyTypeKUR:
+		return b.KUR()
+	default:
+		return nil, &ParseError{Detail: fmt.Sprintf("body type %d is not a cert request", b.Type)}
+	}
+}
+
 func (b *PKIBody) KUP() (*CertRepMessage, error) {
 	if b.Type != BodyTypeKUP {
 		return nil, &ParseError{Detail: fmt.Sprintf("body is not kup (type %d)", b.Type)}

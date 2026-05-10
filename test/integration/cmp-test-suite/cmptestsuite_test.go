@@ -3,8 +3,6 @@
 package cmptestsuite
 
 import (
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"fmt"
 	"log/slog"
 	"net"
@@ -17,7 +15,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"github.com/tsaarni/go-pkicmp/internal/mockserver"
-	"github.com/tsaarni/go-pkicmp/server"
 )
 
 const sharedSecret = "test-shared-secret"
@@ -54,23 +51,13 @@ func startMockServer(t *testing.T) int {
 
 	logger := slog.New(slog.NewTextHandler(newPrefixWriter(os.Stdout, "[mockserver] "), &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	h, caKey, caCert, err := mockserver.New(mockserver.WithLogger(logger))
+	ca, err := mockserver.New(
+		mockserver.WithLogger(logger),
+		mockserver.WithSecret([]byte("CN=CMP Client"), []byte(sharedSecret)),
+	)
 	require.NoError(t, err)
 
-	srv := server.New(h,
-		server.WithSigner(caKey, caCert),
-		server.WithCertificateLookup(h),
-		server.WithSecretLookup(server.SecretLookupFunc(func(senderKID []byte) ([]byte, error) {
-			// RFC 9810 §5.1.1: senderKID identifies the shared secret.
-			// Accept senderKID matching the sender's CN.
-			if string(senderKID) != "CN=CMP Client" {
-				return nil, fmt.Errorf("unknown senderKID: %s", senderKID)
-			}
-			return []byte(sharedSecret), nil
-		})),
-		server.WithExtraCerts([]*x509.Certificate{caCert}),
-		server.WithSender(pkix.Name{CommonName: "Test CA"}),
-	)
+	srv := ca.NewServer()
 
 	mux := http.NewServeMux()
 	mux.Handle("/cmp", srv)

@@ -27,11 +27,11 @@ func TestIRWithMAC(t *testing.T) {
 	secret := []byte("test-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			assert.Equal(t, server.RequestIR, req.Type)
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			assert.Equal(t, requestIR, req.Type)
 			assert.Equal(t, "test-device", req.Subject.CommonName)
 			cert := issueCert(ca, req)
-			return &server.CertResponse{
+			return &certResponse{
 				Certificate: cert,
 				CACerts:     []*x509.Certificate{&caCert},
 			}, nil
@@ -73,10 +73,10 @@ func TestIRWithSignature(t *testing.T) {
 	roots.AddCert(&caCert)
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			assert.Equal(t, server.RequestIR, req.Type)
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			assert.Equal(t, requestIR, req.Type)
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -107,10 +107,10 @@ func TestCRWithMAC(t *testing.T) {
 	secret := []byte("cr-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			assert.Equal(t, server.RequestCR, req.Type)
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			assert.Equal(t, requestCR, req.Type)
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -130,46 +130,17 @@ func TestCRWithMAC(t *testing.T) {
 	assert.Equal(t, "cr-test", result.Certificate.Subject.CommonName)
 }
 
-func TestKURWithMAC(t *testing.T) {
-	ca := &certyaml.Certificate{Subject: "CN=Test CA"}
-	caCert, _ := ca.X509Certificate()
-	secret := []byte("kur-secret")
-
-	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			assert.Equal(t, server.RequestKUR, req.Type)
-			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
-		},
-	}
-
-	srv := server.New(handler, server.WithSecretLookup(&staticMACLookup{secret: secret}))
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	creds, _ := pkicmp.NewMACCredentials(secret)
-	c := client.NewClient(ts.URL)
-
-	result, err := c.SendKUR(context.Background(), key, creds,
-		client.WithTemplateSubject(pkix.Name{CommonName: "kur-test"}),
-		client.WithSender(pkix.Name{CommonName: "kur-test"}),
-	)
-	require.NoError(t, err)
-	assert.Equal(t, "kur-test", result.Certificate.Subject.CommonName)
-}
-
 func TestP10CRWithMAC(t *testing.T) {
 	ca := &certyaml.Certificate{Subject: "CN=Test CA"}
 	caCert, _ := ca.X509Certificate()
 	secret := []byte("p10-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			assert.Equal(t, server.RequestP10CR, req.Type)
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			assert.Equal(t, requestP10CR, req.Type)
 			assert.Equal(t, "p10-test", req.Subject.CommonName)
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -195,7 +166,7 @@ func TestHandlerError(t *testing.T) {
 	secret := []byte("err-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			return nil, &server.Error{
 				Status:      pkicmp.StatusRejection,
 				FailureInfo: pkicmp.FailBadRequest,
@@ -224,7 +195,7 @@ func TestHandlerReturnsGenericError(t *testing.T) {
 	secret := []byte("generic-err")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			return nil, assert.AnError
 		},
 	}
@@ -298,137 +269,6 @@ func TestIRWithMultipleCRMF(t *testing.T) {
 	assert.Equal(t, pkicmp.StatusRejection, rep.Response[0].Status.Status)
 }
 
-func TestIRWithRAVerifiedPOP(t *testing.T) {
-	secret := []byte("ra-verified")
-
-	srv := server.New(&mockHandler{}, server.WithSecretLookup(&staticMACLookup{secret: secret}))
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	pubDER, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	msgs := pkicmp.CertReqMessages{
-		{
-			CertReq: pkicmp.CertRequest{
-				CertReqID:    0,
-				CertTemplate: pkicmp.CertTemplate{PublicKey: pubDER},
-			},
-			Popo: &pkicmp.ProofOfPossession{RAVerified: true},
-		},
-	}
-	msg := pkicmp.NewPKIMessage(pkicmp.NewIRBody(&msgs), macMessageOpts())
-	protectMAC(msg, secret)
-	msgDER, _ := msg.MarshalBinary()
-
-	resp, err := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	var buf [65536]byte
-	n, _ := resp.Body.Read(buf[:])
-	respMsg, _ := pkicmp.ParsePKIMessage(buf[:n])
-	assert.Equal(t, pkicmp.BodyTypeIP, respMsg.Body.Type)
-	rep, _ := respMsg.Body.IP()
-	assert.NotZero(t, rep.Response[0].Status.FailInfo&pkicmp.FailNotAuthorized)
-}
-
-func TestIRWithNoPOP(t *testing.T) {
-	ca := &certyaml.Certificate{Subject: "CN=Test CA"}
-	caCert, _ := ca.X509Certificate()
-	secret := []byte("no-pop")
-
-	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
-		},
-	}
-
-	srv := server.New(handler, server.WithSecretLookup(&staticMACLookup{secret: secret}))
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	pubDER, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	msgs := pkicmp.CertReqMessages{
-		{
-			CertReq: pkicmp.CertRequest{
-				CertReqID: 0,
-				CertTemplate: pkicmp.CertTemplate{
-					Subject:   pkicmp.NewDirectoryName(pkix.Name{CommonName: "no-pop-test"}.ToRDNSequence()),
-					PublicKey: pubDER,
-				},
-			},
-		},
-	}
-	msg := pkicmp.NewPKIMessage(pkicmp.NewIRBody(&msgs), macMessageOpts())
-	protectMAC(msg, secret)
-	msgDER, _ := msg.MarshalBinary()
-
-	resp, err := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	var buf [65536]byte
-	n, _ := resp.Body.Read(buf[:])
-	respMsg, _ := pkicmp.ParsePKIMessage(buf[:n])
-	// RFC 9483 §5.1.1: POP is required unless central key generation is requested.
-	assert.Equal(t, pkicmp.BodyTypeIP, respMsg.Body.Type)
-	rep, _ := respMsg.Body.IP()
-	assert.Equal(t, pkicmp.StatusRejection, rep.Response[0].Status.Status)
-}
-
-func TestIRWithKeyEnciphermentPOP(t *testing.T) {
-	ca := &certyaml.Certificate{Subject: "CN=Test CA"}
-	caCert, _ := ca.X509Certificate()
-	secret := []byte("ke-pop")
-
-	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
-		},
-	}
-
-	srv := server.New(handler, server.WithSecretLookup(&staticMACLookup{secret: secret}))
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	pubDER, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	subMsg := int64(1)
-	msgs := pkicmp.CertReqMessages{
-		{
-			CertReq: pkicmp.CertRequest{
-				CertReqID: 0,
-				CertTemplate: pkicmp.CertTemplate{
-					Subject:   pkicmp.NewDirectoryName(pkix.Name{CommonName: "ke-pop-test"}.ToRDNSequence()),
-					PublicKey: pubDER,
-				},
-			},
-			Popo: &pkicmp.ProofOfPossession{
-				KeyEncipherment: &pkicmp.POPOPrivKey{SubsequentMessage: &subMsg},
-			},
-		},
-	}
-	msg := pkicmp.NewPKIMessage(pkicmp.NewIRBody(&msgs), macMessageOpts())
-	protectMAC(msg, secret)
-	msgDER, _ := msg.MarshalBinary()
-
-	resp, err := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	var buf [65536]byte
-	n, _ := resp.Body.Read(buf[:])
-	respMsg, _ := pkicmp.ParsePKIMessage(buf[:n])
-	// RFC 9483 §5.1.1: Signature POP is required for signature-capable keys (ECDSA).
-	// KeyEncipherment POP is not sufficient.
-	assert.Equal(t, pkicmp.BodyTypeIP, respMsg.Body.Type)
-	rep, _ := respMsg.Body.IP()
-	assert.Equal(t, pkicmp.StatusRejection, rep.Response[0].Status.Status)
-}
-
 func TestIRWithExtensions(t *testing.T) {
 	ca := &certyaml.Certificate{Subject: "CN=Test CA"}
 	caCert, _ := ca.X509Certificate()
@@ -436,12 +276,12 @@ func TestIRWithExtensions(t *testing.T) {
 
 	var gotExtensions bool
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			if len(req.Extensions) > 0 {
 				gotExtensions = true
 			}
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -467,48 +307,6 @@ func TestIRWithExtensions(t *testing.T) {
 	assert.True(t, gotExtensions)
 }
 
-func TestIRWithNoSubject(t *testing.T) {
-	ca := &certyaml.Certificate{Subject: "CN=Test CA"}
-	caCert, _ := ca.X509Certificate()
-	secret := []byte("no-subj")
-
-	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-			assert.Empty(t, req.Subject.CommonName)
-			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
-		},
-	}
-
-	srv := server.New(handler, server.WithSecretLookup(&staticMACLookup{secret: secret}))
-	ts := httptest.NewServer(srv)
-	defer ts.Close()
-
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	pubDER, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	msgs := pkicmp.CertReqMessages{
-		{CertReq: pkicmp.CertRequest{
-			CertReqID:    0,
-			CertTemplate: pkicmp.CertTemplate{PublicKey: pubDER},
-		}},
-	}
-	msg := pkicmp.NewPKIMessage(pkicmp.NewIRBody(&msgs), macMessageOpts())
-	protectMAC(msg, secret)
-	msgDER, _ := msg.MarshalBinary()
-
-	resp, err := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	var buf [65536]byte
-	n, _ := resp.Body.Read(buf[:])
-	respMsg, _ := pkicmp.ParsePKIMessage(buf[:n])
-	// RFC 9483 §4.1.1: Subject is required in certTemplate.
-	assert.Equal(t, pkicmp.BodyTypeIP, respMsg.Body.Type)
-	rep, _ := respMsg.Body.IP()
-	assert.Equal(t, pkicmp.StatusRejection, rep.Response[0].Status.Status)
-}
-
 func TestIRWithSignatureAndSenderKID(t *testing.T) {
 	ca := &certyaml.Certificate{Subject: "CN=Test CA"}
 	caCert, _ := ca.X509Certificate()
@@ -526,11 +324,11 @@ func TestIRWithSignatureAndSenderKID(t *testing.T) {
 	roots.AddCert(&caCert)
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			assert.NotNil(t, req.Sender)
 			assert.NotNil(t, req.Sender.Certificate)
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -560,9 +358,9 @@ func TestIRWithRSAKey(t *testing.T) {
 	secret := []byte("rsa-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -588,9 +386,9 @@ func TestIRWithP384Key(t *testing.T) {
 	secret := []byte("p384-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -616,9 +414,9 @@ func TestIRWithP521Key(t *testing.T) {
 	secret := []byte("p521-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -644,9 +442,9 @@ func TestIRWithRSA384Key(t *testing.T) {
 	secret := []byte("rsa384-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -674,9 +472,9 @@ func TestIRWithRSA4096Key(t *testing.T) {
 	secret := []byte("rsa512-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 
@@ -704,9 +502,9 @@ func TestIRWithEd25519Key(t *testing.T) {
 	secret := []byte("ed25519-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 

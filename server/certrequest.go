@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -9,146 +8,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"errors"
-	"time"
 
 	"github.com/tsaarni/go-pkicmp/pkicmp"
 )
-
-// handleCertRequest processes ir, cr, kur, p10cr messages.
-func (s *Server) handleCertRequest(ctx context.Context, msg *pkicmp.PKIMessage, sender *SenderIdentity) *pkicmp.PKIMessage {
-	// RFC 9810 §5.1.1: Reject if transactionID is already in use.
-	if _, exists := s.pendingRequests.Load(string(msg.Header.TransactionID)); exists {
-		return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
-			Status:   pkicmp.StatusRejection,
-			FailInfo: pkicmp.FailTransactionIdInUse,
-		})
-	}
-
-	var reqType RequestType
-	var certReqID int64
-	var subject pkix.Name
-	var pubKey crypto.PublicKey
-	var extensions []pkix.Extension
-
-	switch msg.Body.Type {
-	case pkicmp.BodyTypeP10CR:
-		reqType = RequestP10CR
-		// RFC 9810 §5.3.4: certReqId MUST be -1 for P10CR.
-		certReqID = -1
-		csr, err := msg.Body.P10CR()
-		if err != nil {
-			return s.buildCertRepResponse(msg, certReqID, pkicmp.PKIStatusInfo{
-				Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailBadDataFormat,
-			}, nil, nil, sender)
-		}
-		// RFC 4211 §4: Verify CSR signature (Proof of Possession).
-		if err := csr.CheckSignature(); err != nil {
-			return s.buildCertRepResponse(msg, certReqID, pkicmp.PKIStatusInfo{
-				Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailBadPOP,
-			}, nil, nil, sender)
-		}
-		subject = csr.Subject
-		pubKey = csr.PublicKey
-		extensions = csr.Extensions
-	default:
-		reqType = RequestType(msg.Body.Type & 0x1f) // strip class bits
-		crmf, err := s.parseCRMF(msg)
-		if err != nil {
-			failInfo := pkicmp.FailBadDataFormat
-			statusText := err.Error()
-			var srvErr *Error
-			if errors.As(err, &srvErr) {
-				failInfo = srvErr.FailureInfo
-				statusText = srvErr.StatusText
-			}
-			return s.buildCertRepResponseForType(msg, certReqID, pkicmp.PKIStatusInfo{
-				Status:       pkicmp.StatusRejection,
-				FailInfo:     failInfo,
-				StatusString: pkicmp.PKIFreeText{statusText},
-			}, nil, nil, sender, reqType)
-		}
-		certReqID = crmf.certReqID
-		subject = crmf.subject
-		pubKey = crmf.publicKey
-		extensions = crmf.extensions
-
-		// Verify POP.
-		if err := s.verifyPOP(msg); err != nil {
-			failInfo := pkicmp.FailBadPOP
-			// RFC 9810 §5.2.8.1: An end entity MUST NOT use raVerified.
-			var parseErr *pkicmp.ParseError
-			if errors.As(err, &parseErr) && parseErr.Detail == "raVerified POP not supported" {
-				failInfo = pkicmp.FailNotAuthorized
-			}
-			return s.buildCertRepResponseForType(msg, certReqID, pkicmp.PKIStatusInfo{
-				Status:       pkicmp.StatusRejection,
-				FailInfo:     failInfo,
-				StatusString: pkicmp.PKIFreeText{err.Error()},
-			}, nil, nil, sender, reqType)
-		}
-
-		// RFC 9483 §5.1.1: POP MUST be present unless central key generation is requested.
-		if crmf.popRequired && crmf.popMissing {
-			return s.buildCertRepResponseForType(msg, certReqID, pkicmp.PKIStatusInfo{
-				Status:       pkicmp.StatusRejection,
-				FailInfo:     pkicmp.FailBadPOP,
-				StatusString: pkicmp.PKIFreeText{"POP required for signature key"},
-			}, nil, nil, sender, reqType)
-		}
-	}
-
-	// RFC 9483 §4.1.1: Subject MUST be present in certTemplate.
-	if len(subject.String()) == 0 {
-		return s.buildCertRepResponseForType(msg, certReqID, pkicmp.PKIStatusInfo{
-			Status:       pkicmp.StatusRejection,
-			FailInfo:     pkicmp.FailBadCertTemplate,
-			StatusString: pkicmp.PKIFreeText{"subject required"},
-		}, nil, nil, sender, reqType)
-	}
-
-	certReq := &CertRequest{
-		Type:          reqType,
-		Subject:       subject,
-		PublicKey:     pubKey,
-		Extensions:    extensions,
-		CertReqID:     certReqID,
-		Sender:        sender,
-		TransactionID: msg.Header.TransactionID,
-		CertProfile:   msg.Header.CertProfile(),
-		Raw:           msg,
-	}
-
-	resp, err := s.handler.HandleCertRequest(ctx, certReq)
-	if err != nil {
-		si := errorToStatusInfo(err)
-		return s.buildCertRepResponse(msg, certReqID, si, nil, nil, sender)
-	}
-
-	// Waiting response → store request type for polling.
-	if resp.Waiting != nil {
-		s.pendingRequests.Store(string(msg.Header.TransactionID), pendingEntry{
-			reqType:   reqType,
-			createdAt: time.Now(),
-		})
-		si := pkicmp.PKIStatusInfo{Status: pkicmp.StatusWaiting}
-		return s.buildCertRepResponse(msg, certReqID, si, nil, nil, sender)
-	}
-
-	// Store issued cert for certHash verification.
-	si := pkicmp.PKIStatusInfo{Status: pkicmp.StatusAccepted}
-	respMsg := s.buildCertRepResponse(msg, certReqID, si, resp.Certificate, resp.CACerts, sender)
-
-	if resp.Certificate != nil {
-		s.issuedCerts.Store(string(msg.Header.TransactionID), issuedCertEntry{
-			cert:        resp.Certificate,
-			senderNonce: respMsg.Header.SenderNonce,
-			createdAt:   time.Now(),
-		})
-	}
-
-	return respMsg
-}
 
 type parsedCRMF struct {
 	certReqID   int64
@@ -159,8 +21,8 @@ type parsedCRMF struct {
 	popRequired bool // Key type requires POP (signature-capable)
 }
 
-// parseCRMF extracts fields from a CRMF request body.
-func (s *Server) parseCRMF(msg *pkicmp.PKIMessage) (*parsedCRMF, error) {
+// parseCRMFMsg extracts fields from a CRMF request body.
+func parseCRMFMsg(msg *pkicmp.PKIMessage) (*parsedCRMF, error) {
 	var msgs *pkicmp.CertReqMessages
 	var err error
 	switch msg.Body.Type {
@@ -222,9 +84,9 @@ func (s *Server) parseCRMF(msg *pkicmp.PKIMessage) (*parsedCRMF, error) {
 	return result, nil
 }
 
-// verifyPOP verifies the Proof of Possession for CRMF requests.
+// verifyPOPMsg verifies the Proof of Possession for CRMF requests.
 // RFC 4211 §4: Delegates to pkicmp.VerifyPOP.
-func (s *Server) verifyPOP(msg *pkicmp.PKIMessage) error {
+func verifyPOPMsg(msg *pkicmp.PKIMessage) error {
 	var msgs *pkicmp.CertReqMessages
 	var err error
 	switch msg.Body.Type {

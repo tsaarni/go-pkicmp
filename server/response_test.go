@@ -25,9 +25,9 @@ func TestWithExtraCertsAndSenderOptions(t *testing.T) {
 	secret := []byte("opts-secret")
 
 	handler := &mockHandler{
-		handleCertRequest: func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
 			cert := issueCert(ca, req)
-			return &server.CertResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
+			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
 	}
 

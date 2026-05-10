@@ -1,10 +1,13 @@
 package server_test
 
 import (
+	"bytes"
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"math/big"
 	"time"
 
@@ -14,32 +17,218 @@ import (
 	"github.com/tsaarni/go-pkicmp/server"
 )
 
-// mockHandler implements server.Handler for testing.
+// requestType identifies the CMP operation type (test-only equivalent of the removed server.RequestType).
+type requestType int
+
+const (
+	requestIR    requestType = 0
+	requestCR    requestType = 2
+	requestP10CR requestType = 4
+	requestKUR   requestType = 7
+)
+
+// certRequest is the parsed enrollment request (test-only equivalent of the removed server.CertRequest).
+type certRequest struct {
+	Type          requestType
+	Subject       pkix.Name
+	PublicKey     crypto.PublicKey
+	Extensions    []pkix.Extension
+	CertReqID     int64
+	Sender        *server.SenderIdentity
+	TransactionID []byte
+	CertProfile   string
+	Raw           *pkicmp.PKIMessage
+}
+
+// certResponse is what the test handler returns (test-only equivalent of the removed server.CertResponse).
+type certResponse struct {
+	Certificate *x509.Certificate
+	CACerts     []*x509.Certificate
+	Waiting     *server.WaitingResponse
+}
+
+// pollRequest is presented when the client polls (test-only).
+type pollRequest struct {
+	TransactionID   []byte
+	CertReqID       int64
+	OriginalRequest requestType
+	Sender          *server.SenderIdentity
+	Raw             *pkicmp.PKIMessage
+}
+
+// certConfirmation is presented when the client sends certConf (test-only).
+type certConfirmation struct {
+	TransactionID []byte
+	Sender        *server.SenderIdentity
+	Accepted      []int64
+	Rejected      []int64
+	Raw           *pkicmp.PKIMessage
+}
+
+// mockHandler implements server.Handler for testing using the old callback pattern.
 type mockHandler struct {
-	handleCertRequest func(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error)
-	handleCertConfirm func(ctx context.Context, confirm *server.CertConfirmation) error
-	handlePollRequest func(ctx context.Context, poll *server.PollRequest) (*server.CertResponse, error)
+	handleCertRequest func(ctx context.Context, req *certRequest) (*certResponse, error)
+	handleCertConfirm func(ctx context.Context, confirm *certConfirmation) error
+	handlePollRequest func(ctx context.Context, poll *pollRequest) (*certResponse, error)
 }
 
-func (m *mockHandler) HandleCertRequest(ctx context.Context, req *server.CertRequest) (*server.CertResponse, error) {
-	if m.handleCertRequest != nil {
-		return m.handleCertRequest(ctx, req)
+func (m *mockHandler) HandleCMP(ctx context.Context, msg *pkicmp.PKIMessage, sender *server.SenderIdentity) (*server.Response, error) {
+	switch msg.Body.Type {
+	case pkicmp.BodyTypeIR, pkicmp.BodyTypeCR, pkicmp.BodyTypeKUR, pkicmp.BodyTypeP10CR:
+		return m.doCertRequest(ctx, msg, sender)
+	case pkicmp.BodyTypeCertConf:
+		return m.doCertConf(ctx, msg, sender)
+	case pkicmp.BodyTypePollReq:
+		return m.doPollReq(ctx, msg, sender)
+	default:
+		return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadRequest}
 	}
-	return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailSystemFailure}
 }
 
-func (m *mockHandler) HandleCertConfirm(ctx context.Context, confirm *server.CertConfirmation) error {
-	if m.handleCertConfirm != nil {
-		return m.handleCertConfirm(ctx, confirm)
+func (m *mockHandler) doCertRequest(ctx context.Context, msg *pkicmp.PKIMessage, sender *server.SenderIdentity) (*server.Response, error) {
+	if m.handleCertRequest == nil {
+		return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailSystemFailure}
 	}
-	return nil
+
+	var rt requestType
+	var certReqID int64
+	var subject pkix.Name
+	var pubKey crypto.PublicKey
+	var extensions []pkix.Extension
+
+	switch msg.Body.Type {
+	case pkicmp.BodyTypeP10CR:
+		rt = requestP10CR
+		certReqID = -1
+		csr, err := msg.Body.P10CR()
+		if err != nil {
+			return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadDataFormat}
+		}
+		subject = csr.Subject
+		pubKey = csr.PublicKey
+		extensions = csr.Extensions
+	default:
+		rt = requestType(msg.Body.Type & 0x1f)
+		msgs, err := getCRMFMessages(msg)
+		if err != nil || msgs == nil || len(*msgs) == 0 {
+			return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadDataFormat}
+		}
+		reqMsg := (*msgs)[0]
+		certReqID = reqMsg.CertReq.CertReqID
+		if len(reqMsg.CertReq.CertTemplate.Subject.DirectoryName) > 0 {
+			subject.FillFromRDNSequence(&reqMsg.CertReq.CertTemplate.Subject.DirectoryName)
+		}
+		if len(reqMsg.CertReq.CertTemplate.PublicKey) > 0 {
+			pubKey, _ = x509.ParsePKIXPublicKey(reqMsg.CertReq.CertTemplate.PublicKey)
+		}
+		if len(reqMsg.CertReq.CertTemplate.Extensions) > 0 {
+			asn1.Unmarshal(reqMsg.CertReq.CertTemplate.Extensions, &extensions)
+		}
+	}
+
+	req := &certRequest{
+		Type:          rt,
+		Subject:       subject,
+		PublicKey:     pubKey,
+		Extensions:    extensions,
+		CertReqID:     certReqID,
+		Sender:        sender,
+		TransactionID: msg.Header.TransactionID,
+		CertProfile:   msg.Header.CertProfile(),
+		Raw:           msg,
+	}
+
+	resp, err := m.handleCertRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return &server.Response{
+		Certificate: resp.Certificate,
+		CACerts:     resp.CACerts,
+		Waiting:     resp.Waiting,
+	}, nil
 }
 
-func (m *mockHandler) HandlePollRequest(ctx context.Context, poll *server.PollRequest) (*server.CertResponse, error) {
-	if m.handlePollRequest != nil {
-		return m.handlePollRequest(ctx, poll)
+func (m *mockHandler) doCertConf(ctx context.Context, msg *pkicmp.PKIMessage, sender *server.SenderIdentity) (*server.Response, error) {
+	if m.handleCertConfirm == nil {
+		return nil, nil
 	}
-	return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailSystemFailure}
+
+	conf, err := msg.Body.CertConf()
+	if err != nil {
+		return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadDataFormat}
+	}
+
+	confirmation := &certConfirmation{
+		TransactionID: msg.Header.TransactionID,
+		Sender:        sender,
+		Raw:           msg,
+	}
+
+	issuedCert := server.IssuedCertFromContext(ctx)
+
+	if len(*conf) == 0 {
+		confirmation.Rejected = []int64{0}
+	} else {
+		for _, cs := range *conf {
+			accepted := true
+			if issuedCert != nil {
+				hash := pkicmp.HashFromSigAlg(issuedCert.SignatureAlgorithm)
+				if hash != 0 {
+					h := hash.New()
+					h.Write(issuedCert.Raw)
+					expected := h.Sum(nil)
+					if !bytes.Equal(cs.CertHash, expected) {
+						accepted = false
+					}
+				}
+			}
+			if cs.StatusInfo != nil && cs.StatusInfo.Status == pkicmp.StatusRejection {
+				accepted = false
+			}
+			if accepted {
+				confirmation.Accepted = append(confirmation.Accepted, cs.CertReqID)
+			} else {
+				confirmation.Rejected = append(confirmation.Rejected, cs.CertReqID)
+			}
+		}
+	}
+
+	_ = m.handleCertConfirm(ctx, confirmation)
+	return nil, nil
+}
+
+func (m *mockHandler) doPollReq(ctx context.Context, msg *pkicmp.PKIMessage, sender *server.SenderIdentity) (*server.Response, error) {
+	if m.handlePollRequest == nil {
+		return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailSystemFailure}
+	}
+
+	pollReqContent, err := msg.Body.PollReq()
+	if err != nil {
+		return nil, &server.Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadDataFormat}
+	}
+
+	var certReqID int64
+	if len(*pollReqContent) > 0 {
+		certReqID = (*pollReqContent)[0]
+	}
+
+	poll := &pollRequest{
+		TransactionID: msg.Header.TransactionID,
+		CertReqID:     certReqID,
+		Sender:        sender,
+		Raw:           msg,
+	}
+
+	resp, err := m.handlePollRequest(ctx, poll)
+	if err != nil {
+		return nil, err
+	}
+	return &server.Response{
+		Certificate: resp.Certificate,
+		CACerts:     resp.CACerts,
+		Waiting:     resp.Waiting,
+	}, nil
 }
 
 // staticMACLookup implements server.SecretLookup with a fixed secret.
@@ -51,7 +240,7 @@ func (l *staticMACLookup) LookupSecret(senderKID []byte) ([]byte, error) {
 	return l.secret, nil
 }
 
-// emptySecretLookup returns an empty secret to trigger the "invalid secret" path.
+// emptySecretLookup returns an empty secret.
 type emptySecretLookup struct{}
 
 func (l *emptySecretLookup) LookupSecret(senderKID []byte) ([]byte, error) {
@@ -65,7 +254,7 @@ func (l *failingLookup) LookupSecret(senderKID []byte) ([]byte, error) {
 	return nil, assert.AnError
 }
 
-// staticCertLookup implements server.CertificateLookup returning a fixed certificate.
+// staticCertLookup implements server.CertificateLookup.
 type staticCertLookup struct {
 	cert *x509.Certificate
 }
@@ -74,15 +263,29 @@ func (l *staticCertLookup) LookupCertificate(sender pkix.Name, senderKID []byte)
 	return l.cert, nil
 }
 
-// failingCertLookup returns an error (unknown sender).
+// failingCertLookup returns an error.
 type failingCertLookup struct{}
 
 func (l *failingCertLookup) LookupCertificate(sender pkix.Name, senderKID []byte) (*x509.Certificate, error) {
 	return nil, assert.AnError
 }
 
+// getCRMFMessages extracts CertReqMessages from a PKIMessage.
+func getCRMFMessages(msg *pkicmp.PKIMessage) (*pkicmp.CertReqMessages, error) {
+	switch msg.Body.Type {
+	case pkicmp.BodyTypeIR:
+		return msg.Body.IR()
+	case pkicmp.BodyTypeCR:
+		return msg.Body.CR()
+	case pkicmp.BodyTypeKUR:
+		return msg.Body.KUR()
+	default:
+		return nil, nil
+	}
+}
+
 // issueCert creates a certificate signed by the CA for the given request.
-func issueCert(ca *certyaml.Certificate, req *server.CertRequest) *x509.Certificate {
+func issueCert(ca *certyaml.Certificate, req *certRequest) *x509.Certificate {
 	caCert, _ := ca.X509Certificate()
 	caKey, _ := ca.PrivateKey()
 

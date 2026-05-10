@@ -2,13 +2,10 @@ package server
 
 import (
 	"context"
-	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
 	"io"
 	"net/http"
-	"sync"
-	"time"
 
 	"github.com/tsaarni/go-pkicmp/pkicmp"
 )
@@ -16,37 +13,18 @@ import (
 // MaxRequestBodySize limits the size of incoming CMP request bodies to prevent DoS.
 var MaxRequestBodySize int64 = 1 << 20 // 1 MiB
 
-// pendingEntry tracks a pending transaction with its creation time for cleanup.
-type pendingEntry struct {
-	reqType   RequestType
-	createdAt time.Time
-}
-
-// issuedCertEntry tracks an issued certificate with its creation time for cleanup.
-type issuedCertEntry struct {
-	cert        *x509.Certificate
-	senderNonce []byte // The senderNonce we sent in the response, for recipNonce validation.
-	createdAt   time.Time
-}
-
 // Server implements http.Handler for the CMP protocol (RFC 6712 §3).
 type Server struct {
 	handler Handler
 	cfg     serverConfig
-
-	// pendingRequests tracks transactionID → pendingEntry for polling.
-	pendingRequests sync.Map
-	// issuedCerts tracks transactionID → issuedCertEntry for certHash verification.
-	issuedCerts sync.Map
-	// activeTransactions tracks transactionID → time.Time for duplicate detection.
-	activeTransactions sync.Map
+	*transactionTracker
 }
 
 // New creates a CMP server with the given handler and options.
 // NOTE: A signer SHOULD be configured (WithSigner) for RFC 9810 compliance,
 // as error messages MUST be signature-protected per RFC 9810 §5.3.21.
 func New(handler Handler, opts ...Option) *Server {
-	s := &Server{handler: handler}
+	s := &Server{handler: handler, transactionTracker: newTransactionTracker()}
 	for _, o := range opts {
 		o(&s.cfg)
 	}
@@ -150,11 +128,11 @@ func (s *Server) processMessage(ctx context.Context, msg *pkicmp.PKIMessage) *pk
 	var resp *pkicmp.PKIMessage
 	switch msg.Body.Type {
 	case pkicmp.BodyTypeIR, pkicmp.BodyTypeCR, pkicmp.BodyTypeKUR, pkicmp.BodyTypeP10CR:
-		resp = s.handleCertRequest(ctx, msg, sender)
+		resp = s.handleCertRequestNew(ctx, msg, sender)
 	case pkicmp.BodyTypeCertConf:
 		resp = s.handleCertConf(ctx, msg, sender)
 	case pkicmp.BodyTypePollReq:
-		resp = s.handlePollReq(ctx, msg, sender)
+		resp = s.handlePollReqNew(ctx, msg, sender)
 	case pkicmp.BodyTypeError:
 		// RFC 9810 §5.3.21: Respond with PKIConf. Protection verification above
 		// already catches invalid headers, so reaching here means the header is valid.
@@ -171,28 +149,7 @@ func (s *Server) processMessage(ctx context.Context, msg *pkicmp.PKIMessage) *pk
 // CleanupExpired removes pending transactions and issued certificates that
 // have exceeded the configured confirmWaitTime. Call this periodically.
 func (s *Server) CleanupExpired() {
-	if s.cfg.confirmWait <= 0 {
-		return
-	}
-	cutoff := time.Now().Add(-s.cfg.confirmWait)
-	s.pendingRequests.Range(func(key, value any) bool {
-		if entry := value.(pendingEntry); entry.createdAt.Before(cutoff) {
-			s.pendingRequests.Delete(key)
-		}
-		return true
-	})
-	s.issuedCerts.Range(func(key, value any) bool {
-		if entry := value.(issuedCertEntry); entry.createdAt.Before(cutoff) {
-			s.issuedCerts.Delete(key)
-		}
-		return true
-	})
-	s.activeTransactions.Range(func(key, value any) bool {
-		if createdAt := value.(time.Time); createdAt.Before(cutoff) {
-			s.activeTransactions.Delete(key)
-		}
-		return true
-	})
+	s.transactionTracker.cleanupExpired(s.cfg.confirmWait)
 }
 
 // verifyRecipient checks that the recipient field in the request matches the
@@ -251,14 +208,18 @@ func (s *Server) validateHeader(msg *pkicmp.PKIMessage, sender *SenderIdentity) 
 		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadRecipientNonce, StatusText: "recipNonce in first message"}
 	}
 
-	// RFC 9483 §4.1: Check for duplicate transactionID.
-	txID := string(msg.Header.TransactionID)
+	// RFC 9483 §4.1: Check for duplicate transactionID (scoped to this client's credentials).
+	credID, err := sender.CredentialID()
+	if err != nil {
+		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadMessageCheck, StatusText: "invalid sender credentials"}
+	}
+	txnID := msg.Header.TransactionID
 	if isFirstMessage {
-		if _, exists := s.activeTransactions.Load(txID); exists {
+		if s.exists(credID, txnID) {
 			return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailTransactionIdInUse, StatusText: "transactionID already in use"}
 		}
 		// Track this transaction.
-		s.activeTransactions.Store(txID, time.Now())
+		s.start(credID, txnID)
 	}
 
 	// RFC 9483 §3.3: Signature-protected messages MUST include extraCerts

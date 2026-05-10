@@ -111,7 +111,3 @@ make setup            # Start EJBCA and setup cmp-test-suite
 make test-integration # Run all integration tests
 make teardown         # Stop EJBCA
 ```
-
-## TODO
-
-- Implementation of CMP server-side logic and message handling.
