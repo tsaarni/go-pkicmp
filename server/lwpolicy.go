@@ -106,6 +106,11 @@ func validateCRMF(msg *pkicmp.PKIMessage) error {
 		return err
 	}
 
+	// RFC 9483 §4.1.3: certReqId MUST be 0.
+	if crmf.certReqID != 0 {
+		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadRequest, StatusText: "certReqId must be 0"}
+	}
+
 	// RFC 4211 §4: Verify POP.
 	if err := verifyPOPMsg(msg); err != nil {
 		failInfo := pkicmp.FailBadPOP

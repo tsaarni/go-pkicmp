@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
 	"io"
@@ -230,6 +231,15 @@ func (s *Server) validateHeader(msg *pkicmp.PKIMessage, sender *SenderIdentity) 
 		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadMessageCheck, StatusText: "signature protection without extraCerts"}
 	}
 
+	// RFC 9483 §3.5: For initial requests, extraCerts MUST contain the complete
+	// certificate chain (signer cert + issuing CA certs). This MAY be omitted
+	// in certConf, PKIConf, pollReq, and pollRep messages.
+	if isFirstMessage && sender != nil && !sender.MACVerified {
+		if err := validateExtraCertsChain(msg.ExtraCerts); err != nil {
+			return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadMessageCheck, StatusText: "incomplete certificate chain in extraCerts"}
+		}
+	}
+
 	return nil
 }
 
@@ -241,4 +251,32 @@ func isInitialRequest(bodyType pkicmp.BodyType) bool {
 	default:
 		return false
 	}
+}
+
+// validateExtraCertsChain verifies that extraCerts contains a complete certificate
+// chain: the signer cert must chain to a self-signed root CA via certificates
+// present in extraCerts. Per RFC 9483 §3.5, the chain must be complete for
+// signature-protected initial request messages.
+func validateExtraCertsChain(extraCerts []pkicmp.CMPCertificate) error {
+	if len(extraCerts) < 2 {
+		return errors.New("chain too short")
+	}
+
+	certs := make([]*x509.Certificate, 0, len(extraCerts))
+	for _, ec := range extraCerts {
+		c, err := ec.Parse()
+		if err != nil {
+			return err
+		}
+		certs = append(certs, c)
+	}
+
+	// Check that at least one certificate in extraCerts is self-signed (root CA).
+	for _, c := range certs {
+		if err := c.CheckSignatureFrom(c); err == nil {
+			return nil
+		}
+	}
+
+	return errors.New("no self-signed root CA in extraCerts")
 }

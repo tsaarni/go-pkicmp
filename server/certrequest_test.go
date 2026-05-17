@@ -88,7 +88,7 @@ func TestIRWithSignature(t *testing.T) {
 	defer ts.Close()
 
 	newKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	creds, err := pkicmp.NewSignatureCredentials(clientKey.(crypto.Signer), &clientX509)
+	creds, err := pkicmp.NewSignatureCredentials(clientKey.(crypto.Signer), &clientX509, &caCert)
 	require.NoError(t, err)
 
 	c := client.NewClient(ts.URL, client.WithTrustedCAs(roots), client.WithExtraCerts([]*x509.Certificate{&clientX509}))
@@ -340,7 +340,7 @@ func TestIRWithSignatureAndSenderKID(t *testing.T) {
 	defer ts.Close()
 
 	newKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	creds, _ := pkicmp.NewSignatureCredentials(clientKey.(crypto.Signer), &clientX509)
+	creds, _ := pkicmp.NewSignatureCredentials(clientKey.(crypto.Signer), &clientX509, &caCert)
 
 	c := client.NewClient(ts.URL, client.WithTrustedCAs(roots), client.WithExtraCerts([]*x509.Certificate{&clientX509}))
 	result, err := c.SendIR(context.Background(), newKey, creds,
