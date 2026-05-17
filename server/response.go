@@ -36,7 +36,9 @@ func (s *Server) buildResponseInternal(req *pkicmp.PKIMessage, body *pkicmp.PKIB
 	if len(s.cfg.sender.CommonName) > 0 || len(s.cfg.sender.Organization) > 0 {
 		senderName = pkicmp.NewDirectoryName(s.cfg.sender.ToRDNSequence())
 	} else if s.cfg.signerCert != nil {
-		senderName = pkicmp.NewDirectoryName(s.cfg.signerCert.Subject.ToRDNSequence())
+		// Use RawSubject to preserve the original DER encoding (e.g., PrintableString
+		// vs UTF8String) from the certificate, avoiding re-encoding through pkix.Name.
+		senderName = pkicmp.NewDirectoryNameFromRawDER(s.cfg.signerCert.RawSubject)
 	}
 
 	resp := &pkicmp.PKIMessage{

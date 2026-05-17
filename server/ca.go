@@ -201,7 +201,6 @@ func NewCAServer(ca CA, caKey crypto.Signer, caCert *x509.Certificate, opts ...O
 		WithSecretLookup(SecretLookupFunc(ca.LookupSecret)),
 		WithCertificateLookup(CertificateLookupFunc(ca.LookupCertificate)),
 		WithExtraCerts([]*x509.Certificate{caCert}),
-		WithSender(caCert.Subject),
 	}
 	return New(
 		Chain(NewCAHandler(ca), LightweightPolicy()),

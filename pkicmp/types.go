@@ -90,6 +90,18 @@ func NewDirectoryName(name pkix.RDNSequence) GeneralName {
 	return GeneralName{DirectoryName: name}
 }
 
+// NewDirectoryNameFromRawDER creates a GeneralName of type directoryName from
+// pre-encoded DER bytes (e.g., x509.Certificate.RawSubject). This preserves
+// the original encoding (PrintableString vs UTF8String) without re-encoding.
+func NewDirectoryNameFromRawDER(rawName []byte) GeneralName {
+	var b cryptobyte.Builder
+	b.AddASN1(cbasn1.Tag(tagDirectoryName).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+		b.AddBytes(rawName)
+	})
+	raw, _ := b.Bytes()
+	return GeneralName{Raw: raw}
+}
+
 // NewRFC822Name creates a GeneralName of type rfc822Name.
 func NewRFC822Name(email string) GeneralName {
 	return GeneralName{RFC822Name: email}
