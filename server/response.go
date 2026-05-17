@@ -13,12 +13,22 @@ import (
 // buildResponse creates a protected response message with proper header management.
 // RFC 9810 §5.1.1: echo transactionID, senderNonce→recipNonce, fresh senderNonce.
 func (s *Server) buildResponse(req *pkicmp.PKIMessage, body *pkicmp.PKIBody, sender *SenderIdentity) *pkicmp.PKIMessage {
-	return s.buildResponseWithInfo(req, body, sender, nil)
+	return s.buildResponseInternal(req, body, sender, nil, nil)
 }
 
 // buildResponseWithInfo creates a protected response with optional generalInfo
 // included before protection is applied.
 func (s *Server) buildResponseWithInfo(req *pkicmp.PKIMessage, body *pkicmp.PKIBody, sender *SenderIdentity, generalInfo []pkicmp.InfoTypeAndValue) *pkicmp.PKIMessage {
+	return s.buildResponseInternal(req, body, sender, generalInfo, nil)
+}
+
+// buildResponseWithMACOptions creates a protected response using stored MAC options.
+func (s *Server) buildResponseWithMACOptions(req *pkicmp.PKIMessage, body *pkicmp.PKIBody, sender *SenderIdentity, macOpts *pkicmp.MACOptions) *pkicmp.PKIMessage {
+	return s.buildResponseInternal(req, body, sender, nil, macOpts)
+}
+
+// buildResponseInternal is the shared implementation for building protected responses.
+func (s *Server) buildResponseInternal(req *pkicmp.PKIMessage, body *pkicmp.PKIBody, sender *SenderIdentity, generalInfo []pkicmp.InfoTypeAndValue, macOpts *pkicmp.MACOptions) *pkicmp.PKIMessage {
 	senderNonce := make([]byte, 16)
 	_, _ = rand.Read(senderNonce)
 
@@ -56,7 +66,7 @@ func (s *Server) buildResponseWithInfo(req *pkicmp.PKIMessage, body *pkicmp.PKIB
 	}
 
 	// Protection failure is non-fatal; unprotected error responses are acceptable per RFC 9810 §5.3.21.
-	_ = s.protectResponse(resp, sender)
+	_ = s.protectResponseWithOptions(resp, sender, macOpts)
 
 	return resp
 }
@@ -105,11 +115,11 @@ func (s *Server) buildCertRepResponseForType(req *pkicmp.PKIMessage, certReqID i
 		body = pkicmp.NewCPBody(rep)
 	}
 
-	// RFC 9810 §5.1.1.1: If the request contains id-it-implicitConfirm in
-	// generalInfo, echo it back to skip the certConf/pkiConf exchange.
+	// RFC 9810 §5.1.1.1: Include id-it-implicitConfirm in the response when
+	// the server is configured for implicit confirm or the request contains it.
 	// RFC 9810 §5.1.1.2: Otherwise include confirmWaitTime if configured.
 	var generalInfo []pkicmp.InfoTypeAndValue
-	if si.Status == pkicmp.StatusAccepted && requestHasImplicitConfirm(req) {
+	if si.Status == pkicmp.StatusAccepted && (s.cfg.implicitConfirm || requestHasImplicitConfirm(req)) {
 		generalInfo = append(generalInfo, pkicmp.InfoTypeAndValue{
 			InfoType: pkicmp.OIDImplicitConfirm,
 		})
@@ -163,6 +173,11 @@ func (s *Server) handleCertRequestNew(ctx context.Context, msg *pkicmp.PKIMessag
 	resp, err := s.handler.HandleCMP(ctx, msg, sender)
 	if err != nil {
 		si := errorToStatusInfo(err)
+		// RFC 9810 §5.3.21: Use error body for fundamental request failures (e.g., unknown
+		// algorithm in P10CR CSR) where the request cannot be processed at all.
+		if si.FailInfo&pkicmp.FailBadAlg != 0 && msg.Body.Type == pkicmp.BodyTypeP10CR {
+			return s.buildErrorResponse(msg, si)
+		}
 		return s.buildCertRepResponseForType(msg, certReqID, si, nil, nil, sender, reqType)
 	}
 
@@ -178,7 +193,7 @@ func (s *Server) handleCertRequestNew(ctx context.Context, msg *pkicmp.PKIMessag
 	respMsg := s.buildCertRepResponseForType(msg, certReqID, si, resp.Certificate, resp.CACerts, sender, reqType)
 
 	if resp.Certificate != nil {
-		s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce)
+		s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, extractMACOptions(msg))
 	}
 
 	return respMsg
@@ -246,7 +261,7 @@ func (s *Server) handlePollReqNew(ctx context.Context, msg *pkicmp.PKIMessage, s
 	respMsg := s.buildCertRepResponseForType(msg, certReqID, si, resp.Certificate, resp.CACerts, sender, pending.reqType)
 
 	if resp.Certificate != nil {
-		s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce)
+		s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, extractMACOptions(msg))
 	}
 	return respMsg
 }

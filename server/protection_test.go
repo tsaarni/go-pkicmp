@@ -182,3 +182,4 @@ func TestMACLookupReturnsError(t *testing.T) {
 	respMsg, _ := pkicmp.ParsePKIMessage(buf[:n])
 	assert.Equal(t, pkicmp.BodyTypeError, respMsg.Body.Type)
 }
+

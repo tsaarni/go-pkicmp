@@ -134,6 +134,7 @@ func (c *CA) LookupCertificate(_ pkix.Name, senderKID []byte) (*x509.Certificate
 
 // NewServer creates a CMP server using this CA.
 func (c *CA) NewServer(opts ...server.Option) *server.Server {
+	opts = append([]server.Option{server.WithImplicitConfirm()}, opts...)
 	return server.NewCAServer(c, c.key, c.cert, opts...)
 }
 

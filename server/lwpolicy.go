@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
@@ -60,7 +61,10 @@ func validateP10CR(msg *pkicmp.PKIMessage) error {
 	}
 	// Verify CSR signature.
 	if err := csr.CheckSignature(); err != nil {
-		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadPOP}
+		if errors.Is(err, x509.ErrUnsupportedAlgorithm) {
+			return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadAlg, StatusText: "unsupported signature algorithm"}
+		}
+		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadPOP, StatusText: err.Error()}
 	}
 	// RFC 9483 §4.1.1: Subject required.
 	if len(csr.Subject.String()) == 0 {
@@ -69,6 +73,10 @@ func validateP10CR(msg *pkicmp.PKIMessage) error {
 	// RFC 5280 §4.2.1.9: Validate BasicConstraints path-length.
 	if err := validateBasicConstraints(csr.Extensions); err != nil {
 		return err
+	}
+	// Policy: Reject requests for CA certificates.
+	if HasCABasicConstraints(csr.Extensions) {
+		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailNotAuthorized, StatusText: "CA certificates not allowed"}
 	}
 	return nil
 }
@@ -122,6 +130,11 @@ func validateCRMF(msg *pkicmp.PKIMessage) error {
 	// RFC 5280 §4.2.1.9: Validate BasicConstraints path-length.
 	if err := validateBasicConstraints(crmf.extensions); err != nil {
 		return err
+	}
+
+	// Policy: Reject requests for CA certificates.
+	if HasCABasicConstraints(crmf.extensions) {
+		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailNotAuthorized, StatusText: "CA certificates not allowed"}
 	}
 
 	return nil

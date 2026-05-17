@@ -25,6 +25,8 @@ import (
 	"crypto/x509"
 	"sync"
 	"time"
+
+	"github.com/tsaarni/go-pkicmp/pkicmp"
 )
 
 // transactionKey is a composite key derived from credentialID and transactionID.
@@ -60,8 +62,10 @@ type transactionEntry struct {
 	pollRef string
 
 	// Set when state == stateIssued
-	cert        *x509.Certificate
-	senderNonce []byte
+	cert             *x509.Certificate
+	senderNonce      []byte
+	clientSenderNonce []byte          // client's original senderNonce from the cert request
+	macOptions       *pkicmp.MACOptions // PBM parameters from the client's request
 }
 
 // transactionTracker manages transaction state for the CMP server.
@@ -109,12 +113,14 @@ func (t *transactionTracker) getPending(credentialID, transactionID []byte) (*tr
 	return &entry, true
 }
 
-func (t *transactionTracker) setIssued(credentialID, transactionID []byte, cert *x509.Certificate, senderNonce []byte) {
+func (t *transactionTracker) setIssued(credentialID, transactionID []byte, cert *x509.Certificate, senderNonce, clientSenderNonce []byte, macOptions *pkicmp.MACOptions) {
 	t.transactions.Store(makeKey(credentialID, transactionID), transactionEntry{
-		state:       stateIssued,
-		createdAt:   time.Now(),
-		cert:        cert,
-		senderNonce: senderNonce,
+		state:             stateIssued,
+		createdAt:         time.Now(),
+		cert:              cert,
+		senderNonce:       senderNonce,
+		clientSenderNonce: clientSenderNonce,
+		macOptions:        macOptions,
 	})
 }
 

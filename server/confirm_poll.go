@@ -29,6 +29,18 @@ func (s *Server) handleCertConf(ctx context.Context, msg *pkicmp.PKIMessage, sen
 		})
 	}
 
+	// RFC 9483 §4.1: Reject contradictory CertStatus entries where status is
+	// accepted but failInfo bits are set.
+	for _, cs := range *conf {
+		if cs.StatusInfo != nil && cs.StatusInfo.Status == pkicmp.StatusAccepted && cs.StatusInfo.FailInfo != 0 {
+			return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
+				Status:       pkicmp.StatusRejection,
+				FailInfo:     pkicmp.FailBadRequest,
+				StatusString: pkicmp.PKIFreeText{"accepted status with failInfo set"},
+			})
+		}
+	}
+
 	// Look up the issued cert entry using composite key — automatically rejects different credentials.
 	credID, err := sender.CredentialID()
 	if err != nil {
@@ -82,9 +94,16 @@ func (s *Server) handleCertConf(ctx context.Context, msg *pkicmp.PKIMessage, sen
 		})
 	}
 
-	// RFC 9483 §3.5: senderNonce MUST be fresh (different from previous message).
-	// The previous message's senderNonce is now our recipNonce, so check against that.
+	// RFC 9483 §3.5: senderNonce MUST be fresh (different from previous messages).
 	if bytes.Equal(msg.Header.SenderNonce, entry.senderNonce) {
+		return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
+			Status:       pkicmp.StatusRejection,
+			FailInfo:     pkicmp.FailBadSenderNonce,
+			StatusString: pkicmp.PKIFreeText{"senderNonce reused"},
+		})
+	}
+	// Also reject if the client reuses their original senderNonce from the cert request.
+	if len(entry.clientSenderNonce) > 0 && bytes.Equal(msg.Header.SenderNonce, entry.clientSenderNonce) {
 		return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
 			Status:       pkicmp.StatusRejection,
 			FailInfo:     pkicmp.FailBadSenderNonce,
@@ -113,7 +132,7 @@ func (s *Server) handleCertConf(ctx context.Context, msg *pkicmp.PKIMessage, sen
 	ctx = context.WithValue(ctx, issuedCertContextKey{}, entry.cert)
 	_, _ = s.handler.HandleCMP(ctx, msg, sender)
 
-	return s.buildResponse(msg, pkicmp.NewPKIConfBody(), sender)
+	return s.buildResponseWithMACOptions(msg, pkicmp.NewPKIConfBody(), sender, entry.macOptions)
 }
 
 // computeCertHash computes the certificate hash using the hash algorithm

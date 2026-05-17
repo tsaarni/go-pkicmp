@@ -44,7 +44,8 @@ type serverConfig struct {
 	certificateLookup CertificateLookup
 	extraCerts  []*x509.Certificate
 	sender      pkix.Name
-	confirmWait time.Duration
+	confirmWait     time.Duration
+	implicitConfirm bool
 }
 
 // WithSigner configures signature-based response protection.
@@ -89,6 +90,15 @@ func WithSender(name pkix.Name) Option {
 func WithConfirmWaitTime(d time.Duration) Option {
 	return func(c *serverConfig) {
 		c.confirmWait = d
+	}
+}
+
+// WithImplicitConfirm configures the server to always include id-it-implicitConfirm
+// in successful certificate responses, skipping the certConf/pkiConf exchange.
+// RFC 9810 §5.1.1.1.
+func WithImplicitConfirm() Option {
+	return func(c *serverConfig) {
+		c.implicitConfirm = true
 	}
 }
 

@@ -19,6 +19,11 @@ type MACOptions struct {
 	IterationCount int                   // default: 10000
 	OWF            asn1.ObjectIdentifier // default: SHA-256
 	MAC            asn1.ObjectIdentifier // default: HMAC-SHA-256
+	// OWFParameters and MACParameters hold the raw ASN.1 parameter bytes
+	// from the AlgorithmIdentifier (e.g., NULL 05 00). When set, these are
+	// echoed back verbatim to preserve the original encoding.
+	OWFParameters []byte
+	MACParameters []byte
 }
 
 // ProtectWithMAC protects the message using Password-Based MAC with default
@@ -83,8 +88,8 @@ func (m *PKIMessage) ProtectWithMACOptions(opts MACOptions) error {
 	p := PBMParameter{
 		Salt:           salt,
 		IterationCount: iterCount,
-		OWF:            AlgorithmIdentifier{Algorithm: owf},
-		MAC:            AlgorithmIdentifier{Algorithm: mac},
+		OWF:            AlgorithmIdentifier{Algorithm: owf, Parameters: opts.OWFParameters},
+		MAC:            AlgorithmIdentifier{Algorithm: mac, Parameters: opts.MACParameters},
 	}
 	var pb cryptobyte.Builder
 	p.marshal(&MarshalContext{MinRequiredPVNO: PVNO2}, &pb)
