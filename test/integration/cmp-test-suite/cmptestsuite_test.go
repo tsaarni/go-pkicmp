@@ -33,15 +33,27 @@ func TestCMPTestSuite(t *testing.T) {
 
 	t.Logf("running cmp-test-suite against port %d (reports: %s)", port, reportsDir)
 
+	// Known upstream test suite bugs — skipped via pre-run modifier.
+	knownFailures := []string{
+		// Test suite bug (tests/cert_conf_tests.robot): expects badRequest but RFC 9483 §3.5
+		// mandates badDataFormat for missing transactionID. The correct test in
+		// tests/lwcmp.robot ("FailInfo Bit Must Be badDataFormat For Missing transactionID") passes.
+		"CA MUST Reject CertConf with omitted transactionID",
+		// pyasn1 bug (pyasn1/pyasn1#53) in tests/lwcmp.robot: encoder.encode() mutates
+		// objects, crashing subsequent __eq__.
+		"CA Must Validate The Received PKI Message",
+	}
+
 	runErr := runCMPTestSuite(t, runOpts{
 		ConfigDir:  configDir,
 		ReportsDir: reportsDir,
 		Tags:       []string{"minimal", "pbmac1"},
 		Excludes:   []string{"revocation", "kga", "genm", "nested", "pq", "sha3", "deprecated"},
+		SkipTests:  knownFailures,
 	})
 
-	t.Log("(test failures from output.xml are listed below)")
-	reportResults(t, reportsDir)
+	t.Log("--- cmp-test-suite results ---")
+	reportResults(t, reportsDir, nil)
 	require.NoError(t, runErr, "cmp-test-suite run failed")
 }
 
@@ -84,3 +96,4 @@ func startMockServer(t *testing.T) int {
 	t.Fatal("mockserver did not become ready")
 	return 0
 }
+

@@ -59,6 +59,7 @@ type runOpts struct {
 	ReportsDir string
 	Tags       []string
 	Excludes   []string
+	SkipTests  []string
 	Timeout    time.Duration
 }
 
@@ -97,6 +98,14 @@ func runCMPTestSuite(t *testing.T, opts runOpts) error {
 	for _, exc := range opts.Excludes {
 		args = append(args, "--exclude", exc)
 	}
+	if len(opts.SkipTests) > 0 {
+		skipModifier := filepath.Join(opts.ConfigDir, "skip_tests.py")
+		arg := skipModifier
+		for _, name := range opts.SkipTests {
+			arg += ":" + name
+		}
+		args = append(args, "--prerunmodifier", arg)
+	}
 	args = append(args, "tests/")
 
 	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
@@ -110,12 +119,7 @@ func runCMPTestSuite(t *testing.T, opts runOpts) error {
 	return cmd.Run()
 }
 
-// reportResults parses Robot Framework output.xml and logs:
-// - Suite setup failures with keyword name and message
-// - Individual test failures (not caused by parent suite setup)
-// - Per-suite pass/fail summary
-// - Overall totals
-func reportResults(t *testing.T, reportsDir string) {
+func reportResults(t *testing.T, reportsDir string, knownFailures map[string]string) {
 	t.Helper()
 
 	path := filepath.Join(reportsDir, "output.xml")
@@ -134,10 +138,8 @@ func reportResults(t *testing.T, reportsDir string) {
 	diags := extractDiagnostics(data)
 
 	t.Log("")
-	t.Logf("=== Parsed results from %s ===", path)
-
 	for i := range output.Suites {
-		reportSuite(t, &output.Suites[i], "", diags)
+		reportSuite(t, &output.Suites[i], "", diags, knownFailures)
 	}
 
 	for _, stat := range output.Statistics.Total.Stats {
@@ -149,47 +151,32 @@ func reportResults(t *testing.T, reportsDir string) {
 	t.Log("")
 }
 
-func reportSuite(t *testing.T, suite *robotSuite, prefix string, diags map[string]string) {
+func reportSuite(t *testing.T, suite *robotSuite, prefix string, diags map[string]string, knownFailures map[string]string) {
 	t.Helper()
 	name := prefix + suite.Name
 
 	// Check for suite setup failure.
-	setupFailed := false
 	for _, kw := range suite.Keywords {
 		if kw.Type == "setup" && kw.Status.Status == "FAIL" {
-			setupFailed = true
 			t.Errorf("Suite setup failed: %s :: %s - %s", name, kw.Name, kw.Status.Text)
 		}
 	}
 
-	// Log individual test failures not caused by parent suite setup.
-	if !setupFailed {
-		for _, test := range suite.Tests {
-			if test.Status.Status == "FAIL" {
-				if diag, ok := diags[test.Name]; ok {
-					t.Errorf("FAIL: %s :: %s - %s [%s]", name, test.Name, test.Status.Text, diag)
-				} else {
-					t.Errorf("FAIL: %s :: %s - %s", name, test.Name, test.Status.Text)
-				}
-			}
-		}
-	}
-
-	// Per-suite summary (only for suites that contain tests).
-	if len(suite.Tests) > 0 {
-		passed, failed := 0, 0
-		for _, test := range suite.Tests {
-			if test.Status.Status == "PASS" {
-				passed++
+	// Log individual test failures.
+	for _, test := range suite.Tests {
+		if test.Status.Status == "FAIL" {
+			if diag, ok := diags[test.Name]; ok {
+				t.Errorf("FAIL: %s :: %s - %s [%s]", name, test.Name, test.Status.Text, diag)
 			} else {
-				failed++
+				t.Errorf("FAIL: %s :: %s - %s", name, test.Name, test.Status.Text)
 			}
+		} else if test.Status.Status == "SKIP" {
+			t.Logf("SKIP: %s :: %s", name, test.Name)
 		}
-		t.Logf("Suite: %s - %d passed, %d failed", suite.Name, passed, failed)
 	}
 
 	for i := range suite.Suites {
-		reportSuite(t, &suite.Suites[i], name+" :: ", diags)
+		reportSuite(t, &suite.Suites[i], name+" :: ", diags, knownFailures)
 	}
 }
 

@@ -64,9 +64,10 @@ func makeCredentialKey(credentialID []byte) credentialKey {
 type txnState int
 
 const (
-	stateActive  txnState = iota // Transaction started, awaiting CA response
-	statePending                 // CA returned "waiting", awaiting poll
-	stateIssued                  // Certificate issued, awaiting certConf
+	stateActive    txnState = iota // Transaction started, awaiting CA response
+	statePending                   // CA returned "waiting", awaiting poll
+	stateIssued                    // Certificate issued, awaiting certConf
+	stateCompleted                 // Transaction completed (implicit confirm or certConf received)
 )
 
 // transactionEntry holds all state for a single transaction.
@@ -231,6 +232,22 @@ func (t *transactionTracker) getIssued(credentialID, transactionID []byte) (*tra
 		return nil, false
 	}
 	return entry, true
+}
+
+// setCompleted marks a transaction as completed (e.g., after implicit confirm).
+// The entry remains to block duplicate transactionIDs until cleanup.
+func (t *transactionTracker) setCompleted(credentialID, transactionID []byte) {
+	key := makeKey(credentialID, transactionID)
+	old, ok := t.transactions.Load(key)
+	if !ok {
+		return
+	}
+	newEntry := &transactionEntry{
+		state:         stateCompleted,
+		lastActivity:  time.Now(),
+		credentialKey: old.(*transactionEntry).credentialKey,
+	}
+	t.transactions.CompareAndSwap(key, old, newEntry)
 }
 
 func (t *transactionTracker) delete(credentialID, transactionID []byte) {

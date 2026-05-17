@@ -121,11 +121,11 @@ func (s *Server) buildCertRepResponseForType(req *pkicmp.PKIMessage, certReqID i
 		body = pkicmp.NewCPBody(rep)
 	}
 
-	// RFC 9810 §5.1.1.1: Include id-it-implicitConfirm in the response when
-	// the server is configured for implicit confirm or the request contains it.
+	// RFC 9810 §5.1.1.1: Include id-it-implicitConfirm in the response only when
+	// the server is configured for implicit confirm AND the client requested it.
 	// RFC 9810 §5.1.1.2: Otherwise include confirmWaitTime if configured.
 	var generalInfo []pkicmp.InfoTypeAndValue
-	if si.Status == pkicmp.StatusAccepted && s.cfg.implicitConfirm {
+	if si.Status == pkicmp.StatusAccepted && s.cfg.implicitConfirm && requestHasImplicitConfirm(req) {
 		generalInfo = append(generalInfo, pkicmp.InfoTypeAndValue{
 			InfoType: pkicmp.OIDImplicitConfirm,
 		})
@@ -205,9 +205,10 @@ func (s *Server) handleCertRequestNew(ctx context.Context, msg *pkicmp.PKIMessag
 	respMsg := s.buildCertRepResponseForType(msg, certReqID, si, resp.Certificate, resp.CACerts, sender, reqType, macOpts)
 
 	if resp.Certificate != nil {
-		if s.cfg.implicitConfirm {
-			// No CertConf will arrive — delete transaction immediately.
-			s.delete(credID, txnID)
+		if s.cfg.implicitConfirm && requestHasImplicitConfirm(msg) {
+			// No CertConf will arrive — mark transaction completed but keep it
+			// to block duplicate transactionIDs until cleanup.
+			s.setCompleted(credID, txnID)
 		} else {
 			if !s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, macOpts) {
 				return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
@@ -309,9 +310,10 @@ func (s *Server) handlePollReqNew(ctx context.Context, msg *pkicmp.PKIMessage, s
 	respMsg := s.buildCertRepResponseForType(msg, certReqID, si, resp.Certificate, resp.CACerts, sender, pending.reqType)
 
 	if resp.Certificate != nil {
-		if s.cfg.implicitConfirm {
-			// No CertConf will arrive — delete transaction immediately.
-			s.delete(credID, txnID)
+		if s.cfg.implicitConfirm && requestHasImplicitConfirm(msg) {
+			// No CertConf will arrive — mark transaction completed but keep it
+			// to block duplicate transactionIDs until cleanup.
+			s.setCompleted(credID, txnID)
 		} else {
 			if !s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, extractMACOptions(msg)) {
 				return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
@@ -336,6 +338,16 @@ func certReqIDFromRequest(msg *pkicmp.PKIMessage) int64 {
 }
 
 // requestTypeFromBody maps a body type to a RequestType.
+// requestHasImplicitConfirm checks if the request includes id-it-implicitConfirm in generalInfo.
+func requestHasImplicitConfirm(msg *pkicmp.PKIMessage) bool {
+	for _, info := range msg.Header.GeneralInfo {
+		if info.InfoType.Equal(pkicmp.OIDImplicitConfirm) {
+			return true
+		}
+	}
+	return false
+}
+
 func requestTypeFromBody(bodyType pkicmp.BodyType) RequestType {
 	switch bodyType {
 	case pkicmp.BodyTypeIR:
