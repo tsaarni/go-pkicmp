@@ -25,10 +25,19 @@ type Server struct {
 // NOTE: A signer SHOULD be configured (WithSigner) for RFC 9810 compliance,
 // as error messages MUST be signature-protected per RFC 9810 §5.3.21.
 func New(handler Handler, opts ...Option) *Server {
-	s := &Server{handler: handler, transactionTracker: newTransactionTracker()}
+	s := &Server{handler: handler}
 	for _, o := range opts {
 		o(&s.cfg)
 	}
+	maxTxn := s.cfg.maxTransactions
+	if maxTxn == 0 {
+		maxTxn = 10000
+	}
+	maxPerCred := s.cfg.maxTransactionsPerCredential
+	if maxPerCred == 0 {
+		maxPerCred = 100
+	}
+	s.transactionTracker = newTransactionTracker(maxTxn, maxPerCred)
 	return s
 }
 
@@ -216,11 +225,13 @@ func (s *Server) validateHeader(msg *pkicmp.PKIMessage, sender *SenderIdentity) 
 	}
 	txnID := msg.Header.TransactionID
 	if isFirstMessage {
-		if s.exists(credID, txnID) {
+		alreadyExists, err := s.startIfAbsent(credID, txnID)
+		if err != nil {
+			return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailSystemUnavail, StatusText: err.Error()}
+		}
+		if alreadyExists {
 			return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailTransactionIdInUse, StatusText: "transactionID already in use"}
 		}
-		// Track this transaction.
-		s.start(credID, txnID)
 	}
 
 	return nil

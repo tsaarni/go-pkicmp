@@ -46,6 +46,8 @@ type serverConfig struct {
 	sender      pkix.Name
 	confirmWait     time.Duration
 	implicitConfirm bool
+	maxTransactions              int
+	maxTransactionsPerCredential int
 }
 
 // WithSigner configures signature-based response protection.
@@ -102,3 +104,19 @@ func WithImplicitConfirm() Option {
 	}
 }
 
+
+// WithMaxTransactions sets the maximum number of concurrent transactions.
+// Default is 10000.
+func WithMaxTransactions(n int) Option {
+	return func(c *serverConfig) {
+		c.maxTransactions = n
+	}
+}
+
+// WithMaxTransactionsPerCredential sets the maximum number of concurrent
+// transactions per credential. Default is 100.
+func WithMaxTransactionsPerCredential(n int) Option {
+	return func(c *serverConfig) {
+		c.maxTransactionsPerCredential = n
+	}
+}

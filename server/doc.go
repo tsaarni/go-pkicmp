@@ -124,11 +124,25 @@
 // [LightweightPolicy] enforces RFC 9483 Lightweight CMP Profile requirements.
 // Custom middleware can add additional policy checks.
 //
+// # Transaction Management
+//
+// The server tracks transactions across multi-message exchanges (IR→IP→CertConf→PKIConf
+// and polling flows). Transactions are keyed by a composite of the client's
+// cryptographically verified credentials and the client-supplied transactionID,
+// preventing cross-client transaction hijacking (RFC 9810 §5.1.1).
+//
+// # Transaction Limits
+//
+// To prevent resource exhaustion, the server enforces transaction caps:
+//
+//   - [WithMaxTransactions]: Global cap on concurrent transactions (default 10000).
+//   - [WithMaxTransactionsPerCredential]: Per-client cap (default 100).
+//
+// When limits are exceeded, new requests are rejected with failInfo systemUnavail.
+//
 // # Transaction Cleanup
 //
-// The server tracks pending transactions and issued certificates for the
-// certConf round-trip. Call [Server.CleanupExpired] periodically to remove
-// stale entries:
+// Call [Server.CleanupExpired] periodically to remove stale entries:
 //
 //	go func() {
 //	    for range time.Tick(time.Minute) {
@@ -136,5 +150,6 @@
 //	    }
 //	}()
 //
-// The cleanup interval is controlled by [WithConfirmWaitTime].
+// Entries are expired based on their last activity time (updated on each state
+// transition). The expiry duration is controlled by [WithConfirmWaitTime].
 package server

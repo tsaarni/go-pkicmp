@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/x509"
@@ -124,7 +125,7 @@ func (s *Server) buildCertRepResponseForType(req *pkicmp.PKIMessage, certReqID i
 	// the server is configured for implicit confirm or the request contains it.
 	// RFC 9810 §5.1.1.2: Otherwise include confirmWaitTime if configured.
 	var generalInfo []pkicmp.InfoTypeAndValue
-	if si.Status == pkicmp.StatusAccepted && (s.cfg.implicitConfirm || requestHasImplicitConfirm(req)) {
+	if si.Status == pkicmp.StatusAccepted && s.cfg.implicitConfirm {
 		generalInfo = append(generalInfo, pkicmp.InfoTypeAndValue{
 			InfoType: pkicmp.OIDImplicitConfirm,
 		})
@@ -146,16 +147,6 @@ func (s *Server) buildCertRepResponseForType(req *pkicmp.PKIMessage, certReqID i
 	}())
 }
 
-// requestHasImplicitConfirm checks if the request contains id-it-implicitConfirm
-// in the PKIHeader generalInfo field (RFC 9810 §5.1.1.1).
-func requestHasImplicitConfirm(req *pkicmp.PKIMessage) bool {
-	for _, gi := range req.Header.GeneralInfo {
-		if gi.InfoType.Equal(pkicmp.OIDImplicitConfirm) {
-			return true
-		}
-	}
-	return false
-}
 
 // handleCertRequestNew processes cert requests via the new Handler interface.
 func (s *Server) handleCertRequestNew(ctx context.Context, msg *pkicmp.PKIMessage, sender *SenderIdentity) *pkicmp.PKIMessage {
@@ -198,9 +189,14 @@ func (s *Server) handleCertRequestNew(ctx context.Context, msg *pkicmp.PKIMessag
 
 	// Waiting response → store request type and pollRef for polling.
 	if resp.Waiting != nil {
-		s.setPending(credID, txnID, reqType, resp.Waiting.PollRef)
 		si := pkicmp.PKIStatusInfo{Status: pkicmp.StatusWaiting}
-		return s.buildCertRepResponseForType(msg, certReqID, si, nil, nil, sender, reqType)
+		respMsg := s.buildCertRepResponseForType(msg, certReqID, si, nil, nil, sender, reqType)
+		if !s.setPending(credID, txnID, reqType, resp.Waiting.PollRef, respMsg.Header.SenderNonce, resp.Waiting.CheckAfter, time.Time{}) {
+			return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
+				Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailSystemFailure,
+			})
+		}
+		return respMsg
 	}
 
 	// Certificate issued.
@@ -209,7 +205,16 @@ func (s *Server) handleCertRequestNew(ctx context.Context, msg *pkicmp.PKIMessag
 	respMsg := s.buildCertRepResponseForType(msg, certReqID, si, resp.Certificate, resp.CACerts, sender, reqType, macOpts)
 
 	if resp.Certificate != nil {
-		s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, macOpts)
+		if s.cfg.implicitConfirm {
+			// No CertConf will arrive — delete transaction immediately.
+			s.delete(credID, txnID)
+		} else {
+			if !s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, macOpts) {
+				return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
+					Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailTransactionIdInUse,
+				})
+			}
+		}
 	}
 
 	return respMsg
@@ -247,6 +252,28 @@ func (s *Server) handlePollReqNew(ctx context.Context, msg *pkicmp.PKIMessage, s
 		})
 	}
 
+	// RFC 9483 §3.5: recipNonce MUST equal the senderNonce of the previous message.
+	if len(msg.Header.RecipNonce) == 0 {
+		return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
+			Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailBadRecipientNonce,
+			StatusString: pkicmp.PKIFreeText{"missing recipNonce"},
+		})
+	}
+	if !bytes.Equal(msg.Header.RecipNonce, pending.senderNonce) {
+		return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
+			Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailBadRecipientNonce,
+			StatusString: pkicmp.PKIFreeText{"recipNonce mismatch"},
+		})
+	}
+
+	// Reject polling too frequently.
+	if !pending.lastPollTime.IsZero() && time.Since(pending.lastPollTime) < pending.checkAfter {
+		return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
+			Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailBadRequest,
+			StatusString: pkicmp.PKIFreeText{"polling too frequently"},
+		})
+	}
+
 	// Pass pollRef to handler via context.
 	ctx = contextWithPollRef(ctx, pending.pollRef)
 
@@ -259,7 +286,6 @@ func (s *Server) handlePollReqNew(ctx context.Context, msg *pkicmp.PKIMessage, s
 
 	// Still waiting → update pollRef and respond with PollRep.
 	if resp.Waiting != nil {
-		s.setPending(credID, txnID, pending.reqType, resp.Waiting.PollRef)
 		checkAfter := int64(resp.Waiting.CheckAfter / time.Second)
 		if checkAfter < 1 {
 			checkAfter = 1
@@ -269,7 +295,13 @@ func (s *Server) handlePollReqNew(ctx context.Context, msg *pkicmp.PKIMessage, s
 			item.Reason = pkicmp.PKIFreeText{resp.Waiting.Reason}
 		}
 		pollRep := pkicmp.PollRepContent{item}
-		return s.buildResponse(msg, pkicmp.NewPollRepBody(&pollRep), sender)
+		respMsg := s.buildResponse(msg, pkicmp.NewPollRepBody(&pollRep), sender)
+		if !s.setPending(credID, txnID, pending.reqType, resp.Waiting.PollRef, respMsg.Header.SenderNonce, resp.Waiting.CheckAfter, time.Now()) {
+			return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
+				Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailSystemFailure,
+			})
+		}
+		return respMsg
 	}
 
 	// Certificate ready → respond with ip/cp/kup matching original request type.
@@ -277,7 +309,16 @@ func (s *Server) handlePollReqNew(ctx context.Context, msg *pkicmp.PKIMessage, s
 	respMsg := s.buildCertRepResponseForType(msg, certReqID, si, resp.Certificate, resp.CACerts, sender, pending.reqType)
 
 	if resp.Certificate != nil {
-		s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, extractMACOptions(msg))
+		if s.cfg.implicitConfirm {
+			// No CertConf will arrive — delete transaction immediately.
+			s.delete(credID, txnID)
+		} else {
+			if !s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, extractMACOptions(msg)) {
+				return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
+					Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailTransactionIdInUse,
+				})
+			}
+		}
 	}
 	return respMsg
 }

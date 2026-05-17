@@ -23,7 +23,10 @@ package server
 import (
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/binary"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tsaarni/go-pkicmp/pkicmp"
@@ -33,13 +36,28 @@ import (
 // It ensures different clients cannot access each other's transactions.
 type transactionKey [sha256.Size]byte
 
+// credentialKey is a hash of the credentialID used for per-credential counting.
+type credentialKey [sha256.Size]byte
+
+// makeKey computes a composite key with length-prefixed components to prevent
+// ambiguity from concatenation of variable-length inputs.
 func makeKey(credentialID, transactionID []byte) transactionKey {
 	h := sha256.New()
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], uint32(len(credentialID)))
+	h.Write(buf[:])
 	h.Write(credentialID)
+	binary.BigEndian.PutUint32(buf[:], uint32(len(transactionID)))
+	h.Write(buf[:])
 	h.Write(transactionID)
 	var key transactionKey
 	copy(key[:], h.Sum(nil))
 	return key
+}
+
+// makeCredentialKey computes a hash of the credentialID for per-credential counting.
+func makeCredentialKey(credentialID []byte) credentialKey {
+	return credentialKey(sha256.Sum256(credentialID))
 }
 
 // txnState represents the current phase of a transaction.
@@ -54,18 +72,22 @@ const (
 // transactionEntry holds all state for a single transaction.
 // A transaction is in exactly one state at a time.
 type transactionEntry struct {
-	state     txnState
-	createdAt time.Time
+	state         txnState
+	lastActivity  time.Time
+	credentialKey credentialKey
 
 	// Set when state == statePending
-	reqType RequestType
-	pollRef string
+	reqType      RequestType
+	pollRef      string
+	senderNonce  []byte        // server's senderNonce from the waiting response (for recipNonce verification)
+	lastPollTime time.Time     // last time a poll was received (zero for initial pending)
+	checkAfter   time.Duration // minimum interval between polls
 
 	// Set when state == stateIssued
-	cert             *x509.Certificate
-	senderNonce      []byte
-	clientSenderNonce []byte          // client's original senderNonce from the cert request
-	macOptions       *pkicmp.MACOptions // PBM parameters from the client's request
+	cert              *x509.Certificate
+	issuedSenderNonce []byte             // server's senderNonce from the issued response
+	clientSenderNonce []byte             // client's original senderNonce from the cert request
+	macOptions        *pkicmp.MACOptions // PBM parameters from the client's request
 }
 
 // transactionTracker manages transaction state for the CMP server.
@@ -73,32 +95,92 @@ type transactionEntry struct {
 // is always computed correctly. This prevents misuse by making it impossible to
 // pass a raw key.
 type transactionTracker struct {
-	transactions sync.Map // transactionKey → transactionEntry
+	transactions sync.Map // transactionKey → *transactionEntry
+
+	count            atomic.Int64
+	maxTransactions  int
+	credentialCounts sync.Map // credentialKey → *atomic.Int64
+	maxTransactionsPerCredential int
 }
 
-func newTransactionTracker() *transactionTracker {
-	return &transactionTracker{}
+func newTransactionTracker(maxTxn, maxPerCred int) *transactionTracker {
+	return &transactionTracker{
+		maxTransactions:              maxTxn,
+		maxTransactionsPerCredential: maxPerCred,
+	}
 }
 
-func (t *transactionTracker) start(credentialID, transactionID []byte) {
-	t.transactions.Store(makeKey(credentialID, transactionID), transactionEntry{
-		state:     stateActive,
-		createdAt: time.Now(),
-	})
+// startIfAbsent atomically creates a new transaction if one does not already exist.
+// Returns (true, nil) if the transaction already existed, (false, nil) on success,
+// or (false, err) if limits are exceeded.
+func (t *transactionTracker) startIfAbsent(credentialID, transactionID []byte) (alreadyExists bool, err error) {
+	key := makeKey(credentialID, transactionID)
+	ck := makeCredentialKey(credentialID)
+
+	// Reserve capacity before storing to prevent transient overshoot.
+	newCount := t.count.Add(1)
+	if int(newCount) > t.maxTransactions {
+		t.count.Add(-1)
+		return false, errors.New("maximum transaction limit reached")
+	}
+
+	credCount := t.getOrCreateCredCount(ck)
+	newCredCount := credCount.Add(1)
+	if int(newCredCount) > t.maxTransactionsPerCredential {
+		credCount.Add(-1)
+		t.count.Add(-1)
+		return false, errors.New("per-credential transaction limit reached")
+	}
+
+	entry := &transactionEntry{
+		state:         stateActive,
+		lastActivity:  time.Now(),
+		credentialKey: ck,
+	}
+
+	// Atomically check existence and store.
+	_, loaded := t.transactions.LoadOrStore(key, entry)
+	if loaded {
+		// Already existed — release reserved capacity.
+		credCount.Add(-1)
+		t.count.Add(-1)
+		return true, nil
+	}
+
+	return false, nil
 }
 
-func (t *transactionTracker) exists(credentialID, transactionID []byte) bool {
-	_, ok := t.transactions.Load(makeKey(credentialID, transactionID))
-	return ok
+// getOrCreateCredCount returns the atomic counter for a credential key.
+func (t *transactionTracker) getOrCreateCredCount(ck credentialKey) *atomic.Int64 {
+	val, _ := t.credentialCounts.LoadOrStore(ck, &atomic.Int64{})
+	return val.(*atomic.Int64)
 }
 
-func (t *transactionTracker) setPending(credentialID, transactionID []byte, reqType RequestType, pollRef string) {
-	t.transactions.Store(makeKey(credentialID, transactionID), transactionEntry{
-		state:     statePending,
-		createdAt: time.Now(),
-		reqType:   reqType,
-		pollRef:   pollRef,
-	})
+func (t *transactionTracker) setPending(credentialID, transactionID []byte, reqType RequestType, pollRef string, senderNonce []byte, checkAfter time.Duration, lastPollTime time.Time) bool {
+	key := makeKey(credentialID, transactionID)
+	ck := makeCredentialKey(credentialID)
+
+	// Load current entry and verify expected state.
+	old, ok := t.transactions.Load(key)
+	if !ok {
+		return false
+	}
+	oldEntry := old.(*transactionEntry)
+	if oldEntry.state != stateActive && oldEntry.state != statePending {
+		return false
+	}
+
+	newEntry := &transactionEntry{
+		state:         statePending,
+		lastActivity:  time.Now(),
+		credentialKey: ck,
+		reqType:       reqType,
+		pollRef:       pollRef,
+		senderNonce:   senderNonce,
+		lastPollTime:  lastPollTime,
+		checkAfter:    checkAfter,
+	}
+	return t.transactions.CompareAndSwap(key, old, newEntry)
 }
 
 func (t *transactionTracker) getPending(credentialID, transactionID []byte) (*transactionEntry, bool) {
@@ -106,22 +188,37 @@ func (t *transactionTracker) getPending(credentialID, transactionID []byte) (*tr
 	if !ok {
 		return nil, false
 	}
-	entry := v.(transactionEntry)
+	entry := v.(*transactionEntry)
 	if entry.state != statePending {
 		return nil, false
 	}
-	return &entry, true
+	return entry, true
 }
 
-func (t *transactionTracker) setIssued(credentialID, transactionID []byte, cert *x509.Certificate, senderNonce, clientSenderNonce []byte, macOptions *pkicmp.MACOptions) {
-	t.transactions.Store(makeKey(credentialID, transactionID), transactionEntry{
+func (t *transactionTracker) setIssued(credentialID, transactionID []byte, cert *x509.Certificate, senderNonce, clientSenderNonce []byte, macOptions *pkicmp.MACOptions) bool {
+	key := makeKey(credentialID, transactionID)
+	ck := makeCredentialKey(credentialID)
+
+	// Load current entry and verify expected state.
+	old, ok := t.transactions.Load(key)
+	if !ok {
+		return false
+	}
+	oldEntry := old.(*transactionEntry)
+	if oldEntry.state != stateActive && oldEntry.state != statePending {
+		return false
+	}
+
+	newEntry := &transactionEntry{
 		state:             stateIssued,
-		createdAt:         time.Now(),
+		lastActivity:      time.Now(),
+		credentialKey:     ck,
 		cert:              cert,
-		senderNonce:       senderNonce,
+		issuedSenderNonce: senderNonce,
 		clientSenderNonce: clientSenderNonce,
 		macOptions:        macOptions,
-	})
+	}
+	return t.transactions.CompareAndSwap(key, old, newEntry)
 }
 
 func (t *transactionTracker) getIssued(credentialID, transactionID []byte) (*transactionEntry, bool) {
@@ -129,15 +226,22 @@ func (t *transactionTracker) getIssued(credentialID, transactionID []byte) (*tra
 	if !ok {
 		return nil, false
 	}
-	entry := v.(transactionEntry)
+	entry := v.(*transactionEntry)
 	if entry.state != stateIssued {
 		return nil, false
 	}
-	return &entry, true
+	return entry, true
 }
 
 func (t *transactionTracker) delete(credentialID, transactionID []byte) {
-	t.transactions.Delete(makeKey(credentialID, transactionID))
+	key := makeKey(credentialID, transactionID)
+	v, loaded := t.transactions.LoadAndDelete(key)
+	if loaded {
+		entry := v.(*transactionEntry)
+		t.count.Add(-1)
+		credCount := t.getOrCreateCredCount(entry.credentialKey)
+		credCount.Add(-1)
+	}
 }
 
 // cleanupExpired removes entries older than maxAge.
@@ -147,8 +251,14 @@ func (t *transactionTracker) cleanupExpired(maxAge time.Duration) {
 	}
 	cutoff := time.Now().Add(-maxAge)
 	t.transactions.Range(func(key, value any) bool {
-		if entry := value.(transactionEntry); entry.createdAt.Before(cutoff) {
-			t.transactions.Delete(key)
+		entry := value.(*transactionEntry)
+		if entry.lastActivity.Before(cutoff) {
+			_, loaded := t.transactions.LoadAndDelete(key)
+			if loaded {
+				t.count.Add(-1)
+				credCount := t.getOrCreateCredCount(entry.credentialKey)
+				credCount.Add(-1)
+			}
 		}
 		return true
 	})

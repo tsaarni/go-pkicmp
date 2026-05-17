@@ -86,7 +86,7 @@ func (s *Server) handleCertConf(ctx context.Context, msg *pkicmp.PKIMessage, sen
 			StatusString: pkicmp.PKIFreeText{"missing recipNonce"},
 		})
 	}
-	if !bytes.Equal(msg.Header.RecipNonce, entry.senderNonce) {
+	if !bytes.Equal(msg.Header.RecipNonce, entry.issuedSenderNonce) {
 		return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
 			Status:       pkicmp.StatusRejection,
 			FailInfo:     pkicmp.FailBadRecipientNonce,
@@ -95,7 +95,7 @@ func (s *Server) handleCertConf(ctx context.Context, msg *pkicmp.PKIMessage, sen
 	}
 
 	// RFC 9483 §3.5: senderNonce MUST be fresh (different from previous messages).
-	if bytes.Equal(msg.Header.SenderNonce, entry.senderNonce) {
+	if bytes.Equal(msg.Header.SenderNonce, entry.issuedSenderNonce) {
 		return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
 			Status:       pkicmp.StatusRejection,
 			FailInfo:     pkicmp.FailBadSenderNonce,
@@ -112,16 +112,13 @@ func (s *Server) handleCertConf(ctx context.Context, msg *pkicmp.PKIMessage, sen
 	}
 
 	// certConf MUST NOT be signed with the newly issued certificate (security best practice).
-	// Only check if both certs have SubjectKeyId set.
 	if sender != nil && sender.Certificate != nil && entry.cert != nil {
-		if len(sender.Certificate.SubjectKeyId) > 0 && len(entry.cert.SubjectKeyId) > 0 {
-			if bytes.Equal(sender.Certificate.SubjectKeyId, entry.cert.SubjectKeyId) {
-				return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
-					Status:       pkicmp.StatusRejection,
-					FailInfo:     pkicmp.FailBadMessageCheck,
-					StatusString: pkicmp.PKIFreeText{"certConf signed with newly issued certificate"},
-				})
-			}
+		if publicKeysEqual(sender.Certificate.PublicKey, entry.cert.PublicKey) {
+			return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
+				Status:       pkicmp.StatusRejection,
+				FailInfo:     pkicmp.FailBadMessageCheck,
+				StatusString: pkicmp.PKIFreeText{"certConf signed with newly issued certificate"},
+			})
 		}
 	}
 
@@ -163,6 +160,19 @@ func hashFromCertSigAlg(sigAlg x509.SignatureAlgorithm) crypto.Hash {
 	default:
 		return 0
 	}
+}
+
+// publicKeysEqual compares two public keys by their PKIX-encoded form.
+func publicKeysEqual(a, b crypto.PublicKey) bool {
+	aDER, err := x509.MarshalPKIXPublicKey(a)
+	if err != nil {
+		return false
+	}
+	bDER, err := x509.MarshalPKIXPublicKey(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(aDER, bDER)
 }
 
 
