@@ -66,6 +66,9 @@ func (s *Server) buildResponseInternal(req *pkicmp.PKIMessage, body *pkicmp.PKIB
 	}
 
 	// Protection failure is non-fatal; unprotected error responses are acceptable per RFC 9810 §5.3.21.
+	if macOpts == nil {
+		macOpts = extractMACOptions(req)
+	}
 	_ = s.protectResponseWithOptions(resp, sender, macOpts)
 
 	return resp
@@ -83,7 +86,7 @@ func (s *Server) buildCertRepResponse(req *pkicmp.PKIMessage, certReqID int64, s
 }
 
 // buildCertRepResponseForType creates a CertRepMessage with the specified response type.
-func (s *Server) buildCertRepResponseForType(req *pkicmp.PKIMessage, certReqID int64, si pkicmp.PKIStatusInfo, cert *x509.Certificate, caCerts []*x509.Certificate, sender *SenderIdentity, reqType RequestType) *pkicmp.PKIMessage {
+func (s *Server) buildCertRepResponseForType(req *pkicmp.PKIMessage, certReqID int64, si pkicmp.PKIStatusInfo, cert *x509.Certificate, caCerts []*x509.Certificate, sender *SenderIdentity, reqType RequestType, macOpts ...*pkicmp.MACOptions) *pkicmp.PKIMessage {
 	certResp := pkicmp.CertResponse{
 		CertReqID: certReqID,
 		Status:    si,
@@ -133,7 +136,12 @@ func (s *Server) buildCertRepResponseForType(req *pkicmp.PKIMessage, certReqID i
 		}
 	}
 
-	return s.buildResponseWithInfo(req, body, sender, generalInfo)
+	return s.buildResponseInternal(req, body, sender, generalInfo, func() *pkicmp.MACOptions {
+		if len(macOpts) > 0 {
+			return macOpts[0]
+		}
+		return nil
+	}())
 }
 
 // requestHasImplicitConfirm checks if the request contains id-it-implicitConfirm
@@ -178,6 +186,11 @@ func (s *Server) handleCertRequestNew(ctx context.Context, msg *pkicmp.PKIMessag
 		if si.FailInfo&pkicmp.FailBadAlg != 0 && msg.Body.Type == pkicmp.BodyTypeP10CR {
 			return s.buildErrorResponse(msg, si)
 		}
+		// Header-level validation failures (e.g., missing directoryName, missing extraCerts)
+		// produce error body responses since the request was not processable.
+		if si.FailInfo&pkicmp.FailBadMessageCheck != 0 {
+			return s.buildErrorResponse(msg, si)
+		}
 		return s.buildCertRepResponseForType(msg, certReqID, si, nil, nil, sender, reqType)
 	}
 
@@ -190,10 +203,11 @@ func (s *Server) handleCertRequestNew(ctx context.Context, msg *pkicmp.PKIMessag
 
 	// Certificate issued.
 	si := pkicmp.PKIStatusInfo{Status: pkicmp.StatusAccepted}
-	respMsg := s.buildCertRepResponseForType(msg, certReqID, si, resp.Certificate, resp.CACerts, sender, reqType)
+	macOpts := extractMACOptions(msg)
+	respMsg := s.buildCertRepResponseForType(msg, certReqID, si, resp.Certificate, resp.CACerts, sender, reqType, macOpts)
 
 	if resp.Certificate != nil {
-		s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, extractMACOptions(msg))
+		s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, macOpts)
 	}
 
 	return respMsg

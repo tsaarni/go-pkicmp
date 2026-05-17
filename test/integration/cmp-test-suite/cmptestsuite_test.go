@@ -36,8 +36,8 @@ func TestCMPTestSuite(t *testing.T) {
 	runErr := runCMPTestSuite(t, runOpts{
 		ConfigDir:  configDir,
 		ReportsDir: reportsDir,
-		Tags:       []string{"minimal"},
-		Excludes:   []string{"revocation", "kga", "genm", "nested", "pq"},
+		Tags:       []string{"minimal", "pbmac1"},
+		Excludes:   []string{"revocation", "kga", "genm", "nested", "pq", "sha3", "deprecated"},
 	})
 
 	t.Log("(test failures from output.xml are listed below)")

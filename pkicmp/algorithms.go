@@ -13,6 +13,7 @@ import (
 var (
 	// Message Digest Algorithms (RFC 9481 §2.1).
 	OIDSHA1   = asn1.ObjectIdentifier{1, 3, 14, 3, 2, 26} // Deprecated: SHOULD NOT be used (RFC 9481 §7.1)
+	OIDSHA224 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 4}
 	OIDSHA256 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
 	OIDSHA384 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 2}
 	OIDSHA512 = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 3}
@@ -32,8 +33,12 @@ var (
 	OIDKemBasedMac      = asn1.ObjectIdentifier{1, 2, 840, 113533, 7, 66, 16}
 	OIDPBMAC1           = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14}
 
+	// PBKDF2 (RFC 8018 §A.2).
+	OIDPBKDF2 = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 12}
+
 	// HMAC Algorithms (RFC 9481 §6.2.1).
 	OIDHMACWithSHA1   = asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 7} // Deprecated: SHOULD NOT be used (RFC 9481 §7.1)
+	OIDHMACWithSHA224 = asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 8}
 	OIDHMACWithSHA256 = asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 9}
 	OIDHMACWithSHA384 = asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 10}
 	OIDHMACWithSHA512 = asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 11}
@@ -48,6 +53,8 @@ func hashFromOID(oid asn1.ObjectIdentifier) (crypto.Hash, error) {
 	switch {
 	case oid.Equal(OIDSHA1): // Deprecated (RFC 9481 §7.1)
 		return crypto.SHA1, nil
+	case oid.Equal(OIDSHA224):
+		return crypto.SHA224, nil
 	case oid.Equal(OIDSHA256):
 		return crypto.SHA256, nil
 	case oid.Equal(OIDSHA384):
@@ -62,6 +69,8 @@ func hmacHashFromOID(oid asn1.ObjectIdentifier) (crypto.Hash, error) {
 	switch {
 	case oid.Equal(OIDHMACWithSHA1) || oid.Equal(OIDPBMMac_HMACSHA1): // Deprecated (RFC 9481 §7.1)
 		return crypto.SHA1, nil
+	case oid.Equal(OIDHMACWithSHA224):
+		return crypto.SHA224, nil
 	case oid.Equal(OIDHMACWithSHA256):
 		return crypto.SHA256, nil
 	case oid.Equal(OIDHMACWithSHA384):
@@ -114,7 +123,15 @@ func HashFromSigAlg(sigAlg x509.SignatureAlgorithm) crypto.Hash {
 func signatureAlgorithmFromKey(key crypto.Signer) (asn1.ObjectIdentifier, crypto.Hash, error) {
 	switch pub := key.Public().(type) {
 	case *rsa.PublicKey:
-		return OIDSHA256WithRSAEncryption, crypto.SHA256, nil
+		// Select hash strength based on key size (NIST SP 800-57 Part 1).
+		switch {
+		case pub.N.BitLen() >= 4096:
+			return OIDSHA512WithRSAEncryption, crypto.SHA512, nil
+		case pub.N.BitLen() >= 3072:
+			return OIDSHA384WithRSAEncryption, crypto.SHA384, nil
+		default:
+			return OIDSHA256WithRSAEncryption, crypto.SHA256, nil
+		}
 	case *ecdsa.PublicKey:
 		switch pub.Curve.Params().BitSize {
 		case 256:

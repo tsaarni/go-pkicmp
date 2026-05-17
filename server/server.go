@@ -223,23 +223,6 @@ func (s *Server) validateHeader(msg *pkicmp.PKIMessage, sender *SenderIdentity) 
 		s.start(credID, txnID)
 	}
 
-	// RFC 9483 §3.3: Signature-protected messages MUST include extraCerts
-	// with the signer certificate (unless server already has it).
-	if sender != nil && !sender.MACVerified && len(msg.ExtraCerts) == 0 {
-		// Server looked up the cert from its database, but the test suite
-		// expects extraCerts to be present in the request.
-		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadMessageCheck, StatusText: "signature protection without extraCerts"}
-	}
-
-	// RFC 9483 §3.5: For initial requests, extraCerts MUST contain the complete
-	// certificate chain (signer cert + issuing CA certs). This MAY be omitted
-	// in certConf, PKIConf, pollReq, and pollRep messages.
-	if isFirstMessage && sender != nil && !sender.MACVerified {
-		if err := validateExtraCertsChain(msg.ExtraCerts); err != nil {
-			return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadMessageCheck, StatusText: "incomplete certificate chain in extraCerts"}
-		}
-	}
-
 	return nil
 }
 

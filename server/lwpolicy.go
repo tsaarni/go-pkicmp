@@ -15,7 +15,37 @@ import (
 func LightweightPolicy() Middleware {
 	return func(next Handler) Handler {
 		return HandlerFunc(func(ctx context.Context, msg *pkicmp.PKIMessage, sender *SenderIdentity) (*Response, error) {
-			// Only validate cert requests.
+			// RFC 9483 §3.1: MAC-protected messages MUST use directoryName in the sender field.
+			if sender.MACVerified && len(msg.Header.Sender.DirectoryName) == 0 {
+				return nil, &Error{
+					Status:      pkicmp.StatusRejection,
+					FailureInfo: pkicmp.FailBadMessageCheck,
+					StatusText:  "MAC protection requires directoryName sender",
+				}
+			}
+
+			// RFC 9483 §3.3: Signature-protected messages MUST include extraCerts.
+			if !sender.MACVerified && len(msg.ExtraCerts) == 0 {
+				return nil, &Error{
+					Status:      pkicmp.StatusRejection,
+					FailureInfo: pkicmp.FailBadMessageCheck,
+					StatusText:  "signature protection without extraCerts",
+				}
+			}
+
+			// RFC 9483 §3.5: For initial requests, extraCerts MUST contain the
+			// complete certificate chain (signer cert + issuing CA certs).
+			if !sender.MACVerified && isInitialRequest(msg.Body.Type) {
+				if err := validateExtraCertsChain(msg.ExtraCerts); err != nil {
+					return nil, &Error{
+						Status:      pkicmp.StatusRejection,
+						FailureInfo: pkicmp.FailBadMessageCheck,
+						StatusText:  "incomplete certificate chain in extraCerts",
+					}
+				}
+			}
+
+			// Only validate cert requests further.
 			if !isCertRequest(msg.Body.Type) {
 				return next.HandleCMP(ctx, msg, sender)
 			}

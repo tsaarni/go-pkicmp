@@ -183,3 +183,42 @@ func TestMACLookupReturnsError(t *testing.T) {
 	assert.Equal(t, pkicmp.BodyTypeError, respMsg.Body.Type)
 }
 
+
+func TestPBMAC1Protection(t *testing.T) {
+	secret := []byte("pbmac1-secret")
+
+	ca := &certyaml.Certificate{Subject: "CN=Test CA"}
+	handler := &mockHandler{
+		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			return &certResponse{Certificate: issueCert(ca, req)}, nil
+		},
+	}
+
+	srv := server.New(handler, server.WithSecretLookup(&staticMACLookup{secret: secret}))
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	creds := &pbmac1Creds{secret: secret}
+
+	c := client.NewClient(ts.URL)
+	result, err := c.SendIR(context.Background(), key, creds,
+		client.WithTemplateSubject(pkix.Name{CommonName: "pbmac1-test"}),
+		client.WithSender(pkix.Name{CommonName: "pbmac1-test"}),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "CN=pbmac1-test", result.Certificate.Subject.String())
+}
+
+// pbmac1Creds explicitly uses PBMAC1 protection for testing.
+type pbmac1Creds struct {
+	secret []byte
+}
+
+func (c *pbmac1Creds) Protect(msg *pkicmp.PKIMessage) error {
+	return msg.ProtectWithPBMAC1(c.secret)
+}
+
+func (c *pbmac1Creds) SharedSecret() []byte {
+	return c.secret
+}

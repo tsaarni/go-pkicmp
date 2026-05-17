@@ -5,9 +5,11 @@ import (
 	"crypto/hmac"
 	"crypto/subtle"
 	"crypto/x509"
+	"encoding/asn1"
 	"fmt"
 
 	"golang.org/x/crypto/cryptobyte"
+	"golang.org/x/crypto/pbkdf2"
 )
 
 // VerifyOptions provides trust material for message protection verification.
@@ -80,6 +82,9 @@ func (m *PKIMessage) Verify(opts VerifyOptions) (*VerifyResult, error) {
 	if alg.Equal(OIDPasswordBasedMac) {
 		return m.verifyPBM(opts)
 	}
+	if alg.Equal(OIDPBMAC1) {
+		return m.verifyPBMAC1(opts)
+	}
 	if _, err := SigAlgFromOID(alg); err == nil {
 		return m.verifySignature(opts)
 	}
@@ -136,6 +141,72 @@ func (m *PKIMessage) verifyPBM(opts VerifyOptions) (*VerifyResult, error) {
 	mac := hmac.New(macHash.New, k)
 	mac.Write(data)
 	expected := mac.Sum(nil)
+
+	if subtle.ConstantTimeCompare(expected, m.Protection) != 1 {
+		return nil, &VerificationError{Reason: ReasonBadMAC}
+	}
+
+	return &VerifyResult{MACVerified: true}, nil
+}
+
+// verifyPBMAC1 verifies PBMAC1 protection.
+// RFC 8018 §7.1, RFC 9481 §6.1.2.
+func (m *PKIMessage) verifyPBMAC1(opts VerifyOptions) (*VerifyResult, error) {
+	var secret []byte
+	if opts.Credentials != nil {
+		secret = opts.Credentials.SharedSecret()
+	}
+	if len(secret) == 0 {
+		return nil, &VerificationError{Reason: ReasonMissingSharedSecret}
+	}
+
+	// Parse PBMAC1-params (RFC 8018 §A.5).
+	var pbmac1Params struct {
+		KeyDerivationFunc algorithmIdentifierASN1
+		MessageAuthScheme algorithmIdentifierASN1
+	}
+	if _, err := asn1.Unmarshal(m.Header.ProtectionAlg.Parameters, &pbmac1Params); err != nil {
+		return nil, &ParseError{Detail: "invalid PBMAC1-params: " + err.Error()}
+	}
+
+	if !pbmac1Params.KeyDerivationFunc.Algorithm.Equal(OIDPBKDF2) {
+		return nil, &VerificationError{Reason: ReasonUnsupportedAlgorithm, Err: fmt.Errorf("KDF OID %v", pbmac1Params.KeyDerivationFunc.Algorithm)}
+	}
+
+	// Parse PBKDF2-params from keyDerivationFunc.Parameters.
+	var pbkdf2Params struct {
+		Salt           []byte
+		IterationCount int
+		KeyLength      int
+		PRF            algorithmIdentifierASN1
+	}
+	if _, err := asn1.Unmarshal(pbmac1Params.KeyDerivationFunc.Parameters.FullBytes, &pbkdf2Params); err != nil {
+		return nil, &ParseError{Detail: "invalid PBKDF2-params: " + err.Error()}
+	}
+
+	if err := validatePBMIterationCount(pbkdf2Params.IterationCount); err != nil {
+		return nil, err
+	}
+
+	prfHash, err := hmacHashFromOID(pbkdf2Params.PRF.Algorithm)
+	if err != nil {
+		return nil, err
+	}
+	macHash, err := hmacHashFromOID(pbmac1Params.MessageAuthScheme.Algorithm)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := m.protectedPart()
+	if err != nil {
+		return nil, err
+	}
+
+	// Derive key using PBKDF2 (RFC 8018 §5.2).
+	k := pbkdf2.Key(secret, pbkdf2Params.Salt, pbkdf2Params.IterationCount, pbkdf2Params.KeyLength, prfHash.New)
+	h := hmac.New(macHash.New, k)
+	h.Write(data)
+	expected := h.Sum(nil)
 
 	if subtle.ConstantTimeCompare(expected, m.Protection) != 1 {
 		return nil, &VerificationError{Reason: ReasonBadMAC}

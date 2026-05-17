@@ -307,9 +307,6 @@ func (h *PKIHeader) unmarshal(s *cryptobyte.String) error {
 	if !seq.ReadASN1Integer(&pvno) {
 		return &ParseError{Detail: "invalid pvno"}
 	}
-	if pvno == PVNO1 {
-		return &ParseError{Detail: "CMPv1 is not supported"}
-	}
 	h.PVNO = int(pvno)
 
 	// sender
@@ -441,7 +438,8 @@ func (h *PKIHeader) marshal(mctx *MarshalContext, b *cryptobyte.Builder) {
 
 		if !h.MessageTime.IsZero() {
 			b.AddASN1(cbasn1.Tag(0).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
-				b.AddASN1GeneralizedTime(h.MessageTime)
+				// X.690 §11.7: DER GeneralizedTime MUST be UTC.
+				b.AddASN1GeneralizedTime(h.MessageTime.UTC())
 			})
 		}
 
