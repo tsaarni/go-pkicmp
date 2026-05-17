@@ -53,7 +53,7 @@ func TestCMPTestSuite(t *testing.T) {
 	})
 
 	t.Log("--- cmp-test-suite results ---")
-	reportResults(t, reportsDir, nil)
+	reportResults(t, reportsDir)
 	require.NoError(t, runErr, "cmp-test-suite run failed")
 }
 
@@ -96,4 +96,3 @@ func startMockServer(t *testing.T) int {
 	t.Fatal("mockserver did not become ready")
 	return 0
 }
-

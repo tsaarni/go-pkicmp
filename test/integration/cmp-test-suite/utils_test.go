@@ -119,7 +119,7 @@ func runCMPTestSuite(t *testing.T, opts runOpts) error {
 	return cmd.Run()
 }
 
-func reportResults(t *testing.T, reportsDir string, knownFailures map[string]string) {
+func reportResults(t *testing.T, reportsDir string) {
 	t.Helper()
 
 	path := filepath.Join(reportsDir, "output.xml")
@@ -139,19 +139,19 @@ func reportResults(t *testing.T, reportsDir string, knownFailures map[string]str
 
 	t.Log("")
 	for i := range output.Suites {
-		reportSuite(t, &output.Suites[i], "", diags, knownFailures)
+		reportSuite(t, &output.Suites[i], "", diags)
 	}
 
 	for _, stat := range output.Statistics.Total.Stats {
 		if stat.Text == "All Tests" {
-			t.Logf("Robot Framework: %d passed, %d failed", stat.Pass, stat.Fail)
+			t.Logf("Robot Framework: %d passed, %d failed, %d skipped", stat.Pass, stat.Fail, stat.Skip)
 		}
 	}
 
 	t.Log("")
 }
 
-func reportSuite(t *testing.T, suite *robotSuite, prefix string, diags map[string]string, knownFailures map[string]string) {
+func reportSuite(t *testing.T, suite *robotSuite, prefix string, diags map[string]string) {
 	t.Helper()
 	name := prefix + suite.Name
 
@@ -170,13 +170,11 @@ func reportSuite(t *testing.T, suite *robotSuite, prefix string, diags map[strin
 			} else {
 				t.Errorf("FAIL: %s :: %s - %s", name, test.Name, test.Status.Text)
 			}
-		} else if test.Status.Status == "SKIP" {
-			t.Logf("SKIP: %s :: %s", name, test.Name)
 		}
 	}
 
 	for i := range suite.Suites {
-		reportSuite(t, &suite.Suites[i], name+" :: ", diags, knownFailures)
+		reportSuite(t, &suite.Suites[i], name+" :: ", diags)
 	}
 }
 
@@ -222,6 +220,7 @@ type robotStat struct {
 	Text string `xml:",chardata"`
 	Pass int    `xml:"pass,attr"`
 	Fail int    `xml:"fail,attr"`
+	Skip int    `xml:"skip,attr"`
 }
 
 // extractDiagnostics scans raw output.xml bytes and builds a map of
