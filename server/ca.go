@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto"
 	"crypto/rand"
 	"crypto/sha1" // #nosec G505 -- used for SKI computation (opaque identifier)
 	"crypto/x509"
@@ -188,14 +187,12 @@ func bodyTypeToRequestType(t pkicmp.BodyType) RequestType {
 // verification separately with [WithSecretLookup] and/or
 // [WithCertificateLookup]. Use middleware to add policy enforcement
 // (e.g., [LightweightPolicy]).
-func NewCAServer(ca CA, caKey crypto.Signer, caCert *x509.Certificate, mw []Middleware, opts ...Option) *Server {
-	defaultOpts := []Option{
-		WithSigner(caKey, caCert),
-		WithExtraCerts([]*x509.Certificate{caCert}),
-	}
+// Use [WithSigner] and [WithExtraCerts] options to configure the signing
+// credentials for CMP response protection.
+func NewCAServer(ca CA, mw []Middleware, opts ...Option) *Server {
 	return New(
 		Chain(NewCAHandler(ca), mw...),
-		append(defaultOpts, opts...)...,
+		opts...,
 	)
 }
 

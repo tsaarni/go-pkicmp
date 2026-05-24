@@ -2,6 +2,7 @@
 package main
 
 import (
+	"crypto/x509"
 	"log/slog"
 	"net/http"
 	"time"
@@ -29,14 +30,17 @@ func main() {
 
 	// Connect the CA into a CMP server.
 	//
-	//   - ca.Key()/ca.Cert(): sign every outgoing response; key is a crypto.Signer
-	//     so an HSM-backed signer can be used in production.
 	//   - LightweightPolicy: enforces the mandatory checks from RFC 9483.
+	//   - WithSigner: signs every outgoing response with the CA key; a crypto.Signer
+	//     so an HSM-backed signer can be used in production.
+	//   - WithExtraCerts: appends the CA cert to outgoing response extraCerts.
 	//   - WithImplicitConfirm: skips the certConf/PKIConf round-trip.
 	//   - WithSecretLookup: enables MAC (shared-secret) protection for IR/CR.
 	//   - WithCertificateLookup: enables signature protection for KUR/certConf.
-	srv := server.NewCAServer(ca, ca.Key(), ca.Cert(),
+	srv := server.NewCAServer(ca,
 		[]server.Middleware{server.LightweightPolicy()},
+		server.WithSigner(ca.Key(), ca.Cert()),
+		server.WithExtraCerts([]*x509.Certificate{ca.Cert()}),
 		server.WithImplicitConfirm(),
 		server.WithSecretLookup(ca),
 		server.WithCertificateLookup(ca),

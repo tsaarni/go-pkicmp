@@ -3,12 +3,23 @@ package server
 import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"fmt"
 
 	"github.com/tsaarni/go-pkicmp/pkicmp"
 	"golang.org/x/crypto/cryptobyte"
 	cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
 )
+
+// macRequestParams holds the echoed MAC parameters extracted from a client request.
+// Used to apply matching protection to the response.
+type macRequestParams struct {
+	algorithm      asn1.ObjectIdentifier
+	iterationCount int
+	keyLength      int
+	owf            asn1.ObjectIdentifier
+	mac            asn1.ObjectIdentifier
+	owfParameters  []byte
+	macParameters  []byte
+}
 
 // verifyProtection verifies message protection and returns the sender identity.
 func (s *Server) verifyProtection(msg *pkicmp.PKIMessage) (*SenderIdentity, error) {
@@ -19,7 +30,7 @@ func (s *Server) verifyProtection(msg *pkicmp.PKIMessage) (*SenderIdentity, erro
 	alg := msg.Header.ProtectionAlg.Algorithm
 
 	// MAC-protected message.
-	if alg.Equal(pkicmp.OIDPasswordBasedMac) || alg.Equal(pkicmp.OIDPBMAC1) {
+	if isMACAlgorithm(alg) {
 		if s.cfg.secretLookup == nil {
 			return nil, &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadMessageCheck, StatusText: "MAC protection not configured"}
 		}
@@ -34,11 +45,9 @@ func (s *Server) verifyProtection(msg *pkicmp.PKIMessage) (*SenderIdentity, erro
 		if err != nil {
 			return nil, &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadMessageCheck, StatusText: "unknown sender"}
 		}
-		creds, err := pkicmp.NewMACCredentials(secret)
-		if err != nil {
-			return nil, &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadMessageCheck, StatusText: "invalid secret"}
-		}
-		_, err = msg.Verify(pkicmp.VerifyOptions{Credentials: creds})
+		creds, _ := pkicmp.NewMACCredentials(secret)
+		_, err = msg.Verify(pkicmp.VerifyOptions{SharedSecret: secret})
+		_ = creds // silence unused warning
 		if err != nil {
 			return nil, &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadMessageCheck, StatusText: "MAC verification failed"}
 		}
@@ -80,34 +89,64 @@ func (s *Server) verifyProtection(msg *pkicmp.PKIMessage) (*SenderIdentity, erro
 	return &SenderIdentity{Certificate: signerCert, Sender: senderName}, nil
 }
 
+// isMACAlgorithm returns true if the OID is a supported MAC protection algorithm.
+func isMACAlgorithm(oid asn1.ObjectIdentifier) bool {
+	// OIDPasswordBasedMac = 1.2.840.113533.7.66.13
+	// OIDPBMAC1 = 1.2.840.113549.1.5.14
+	return oid.Equal(asn1.ObjectIdentifier{1, 2, 840, 113533, 7, 66, 13}) ||
+		oid.Equal(asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14})
+}
+
+// oidPBMAC1 is the OID for PBMAC1.
+var oidPBMAC1server = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14}
+
+// oidPasswordBasedMac is the OID for PasswordBasedMac.
+var oidPasswordBasedMacServer = asn1.ObjectIdentifier{1, 2, 840, 113533, 7, 66, 13}
+
+// oidPBKDF2Server is the OID for PBKDF2.
+var oidPBKDF2server = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 12}
+
 // protectResponseWithOptions applies protection using stored MAC options when available.
-func (s *Server) protectResponseWithOptions(resp *pkicmp.PKIMessage, sender *SenderIdentity, macOpts *pkicmp.MACOptions) error {
+func (s *Server) protectResponseWithOptions(resp *pkicmp.PKIMessage, sender *SenderIdentity, macOpts *macRequestParams) error {
 	// MAC-protected request → MAC-protect response with same secret.
 	if sender != nil && sender.MACVerified && len(sender.secret) > 0 {
 		secret := sender.secret
+		var opts []pkicmp.MACCredentialOption
 		if macOpts != nil {
-			// Echo back the client's MAC parameters (fresh salt is generated).
-			if macOpts.Algorithm.Equal(pkicmp.OIDPBMAC1) {
-				// RFC 9481 §6.1.2: PBMAC1 protection.
-				return resp.ProtectWithPBMAC1Options(pkicmp.PBMAC1Options{
-					Secret:         secret,
-					IterationCount: macOpts.IterationCount,
-					KeyLength:      macOpts.KeyLength,
-					PRF:            macOpts.OWF,
-					MAC:            macOpts.MAC,
-				})
+			opts = append(opts, pkicmp.WithMACAlgorithm(macOpts.algorithm))
+			if macOpts.iterationCount != 0 {
+				opts = append(opts, pkicmp.WithMACIterationCount(macOpts.iterationCount))
 			}
-			opts := *macOpts
-			opts.Secret = secret
-			return resp.ProtectWithMACOptions(opts)
+			if macOpts.keyLength != 0 {
+				opts = append(opts, pkicmp.WithMACKeyLength(macOpts.keyLength))
+			}
+			if macOpts.owf != nil {
+				opts = append(opts, pkicmp.WithMAC_OWF(macOpts.owf))
+			}
+			if macOpts.mac != nil {
+				opts = append(opts, pkicmp.WithMAC_MAC(macOpts.mac))
+			}
+			if len(macOpts.owfParameters) > 0 {
+				opts = append(opts, pkicmp.WithMACOWFParameters(macOpts.owfParameters))
+			}
+			if len(macOpts.macParameters) > 0 {
+				opts = append(opts, pkicmp.WithMACMACParameters(macOpts.macParameters))
+			}
 		}
-		// extractMACOptions must succeed for any message that passed MAC verification.
-		return fmt.Errorf("internal error: MAC-verified message has no parseable MAC parameters")
+		creds, err := pkicmp.NewMACCredentials(secret, opts...)
+		if err != nil {
+			return err
+		}
+		return creds.Protect(resp)
 	}
 
 	// Signature protection.
 	if s.cfg.signerKey != nil && s.cfg.signerCert != nil {
-		return resp.ProtectWithSignature(s.cfg.signerKey, s.cfg.signerCert, s.cfg.signerChain...)
+		creds, err := pkicmp.NewSignatureCredentials(s.cfg.signerKey, s.cfg.signerCert, s.cfg.signerChain...)
+		if err != nil {
+			return err
+		}
+		return creds.Protect(resp)
 	}
 
 	return nil
@@ -115,7 +154,7 @@ func (s *Server) protectResponseWithOptions(resp *pkicmp.PKIMessage, sender *Sen
 
 // extractMACOptions extracts PBM/PBMAC1 parameters from a MAC-protected request message.
 // Returns nil if the message is not MAC-protected or parameters cannot be parsed.
-func extractMACOptions(msg *pkicmp.PKIMessage) *pkicmp.MACOptions {
+func extractMACOptions(msg *pkicmp.PKIMessage) *macRequestParams {
 	if msg.Header.ProtectionAlg == nil {
 		return nil
 	}
@@ -126,11 +165,11 @@ func extractMACOptions(msg *pkicmp.PKIMessage) *pkicmp.MACOptions {
 	alg := msg.Header.ProtectionAlg.Algorithm
 
 	// RFC 8018 §7.1: PBMAC1 parameters.
-	if alg.Equal(pkicmp.OIDPBMAC1) {
+	if alg.Equal(oidPBMAC1server) {
 		return extractPBMAC1Options(msg.Header.ProtectionAlg.Parameters)
 	}
 
-	if !alg.Equal(pkicmp.OIDPasswordBasedMac) {
+	if !alg.Equal(oidPasswordBasedMacServer) {
 		return nil
 	}
 
@@ -187,19 +226,19 @@ func extractMACOptions(msg *pkicmp.PKIMessage) *pkicmp.MACOptions {
 		}
 	}
 
-	return &pkicmp.MACOptions{
-		Algorithm:      pkicmp.OIDPasswordBasedMac,
-		IterationCount: int(iterCount),
-		OWF:            owfOID,
-		MAC:            macOID,
-		OWFParameters:  owfParams,
-		MACParameters:  macParams,
+	return &macRequestParams{
+		algorithm:      oidPasswordBasedMacServer,
+		iterationCount: int(iterCount),
+		owf:            owfOID,
+		mac:            macOID,
+		owfParameters:  owfParams,
+		macParameters:  macParams,
 	}
 }
 
 // extractPBMAC1Options parses PBMAC1-params (RFC 8018 §A.4) from protectionAlg parameters.
 // PBMAC1-params ::= SEQUENCE { keyDerivationFunc AlgorithmIdentifier, messageAuthScheme AlgorithmIdentifier }
-func extractPBMAC1Options(params []byte) *pkicmp.MACOptions {
+func extractPBMAC1Options(params []byte) *macRequestParams {
 	s := cryptobyte.String(params)
 	var outer cryptobyte.String
 	if !s.ReadASN1(&outer, cbasn1.SEQUENCE) {
@@ -215,7 +254,7 @@ func extractPBMAC1Options(params []byte) *pkicmp.MACOptions {
 	if !kdfSeq.ReadASN1ObjectIdentifier(&kdfOID) {
 		return nil
 	}
-	if !kdfOID.Equal(pkicmp.OIDPBKDF2) {
+	if !kdfOID.Equal(oidPBKDF2server) {
 		return nil
 	}
 
@@ -277,11 +316,11 @@ func extractPBMAC1Options(params []byte) *pkicmp.MACOptions {
 		return nil
 	}
 
-	return &pkicmp.MACOptions{
-		Algorithm:      pkicmp.OIDPBMAC1,
-		IterationCount: int(iterCount),
-		KeyLength:      int(keyLength),
-		OWF:            prfOID, // Reuse OWF field for PRF OID.
-		MAC:            macOID,
+	return &macRequestParams{
+		algorithm:      oidPBMAC1server,
+		iterationCount: int(iterCount),
+		keyLength:      int(keyLength),
+		owf:            prfOID,
+		mac:            macOID,
 	}
 }

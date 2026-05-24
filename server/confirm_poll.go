@@ -42,7 +42,7 @@ func (s *Server) handleCertConf(ctx context.Context, msg *pkicmp.PKIMessage, sen
 	}
 
 	// Look up the issued cert entry using composite key — automatically rejects different credentials.
-	credID, err := sender.CredentialID()
+	credID, err := sender.credentialID()
 	if err != nil {
 		return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
 			Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailBadMessageCheck,

@@ -56,8 +56,10 @@
 //	}
 //
 //	// Create server
-//	srv := server.NewCAServer(ca, caKey, caCert,
+//	srv := server.NewCAServer(ca,
 //	    []server.Middleware{server.LightweightPolicy()},
+//	    server.WithSigner(caKey, caCert),
+//	    server.WithExtraCerts([]*x509.Certificate{caCert}),
 //	    server.WithSecretLookup(server.SecretLookupFunc(lookupSecret)),
 //	    server.WithCertificateLookup(server.CertificateLookupFunc(lookupCertificate)),
 //	)
@@ -177,8 +179,10 @@
 //
 // Example with additional custom policy:
 //
-//	srv := server.NewCAServer(ca, caKey, caCert,
+//	srv := server.NewCAServer(ca,
 //	    []server.Middleware{server.LightweightPolicy(), myPolicy()},
+//	    server.WithSigner(caKey, caCert),
+//	    server.WithExtraCerts([]*x509.Certificate{caCert}),
 //	    server.WithSecretLookup(server.SecretLookupFunc(lookupSecret)),
 //	    server.WithCertificateLookup(server.CertificateLookupFunc(lookupCertificate)),
 //	)
@@ -211,13 +215,17 @@
 // Example:
 //
 //	mux := http.NewServeMux()
-//	mux.Handle("/.well-known/cmp/p/ca1", server.NewCAServer(ca1, ca1Key, ca1Cert,
+//	mux.Handle("/.well-known/cmp/p/ca1", server.NewCAServer(ca1,
 //	    []server.Middleware{server.LightweightPolicy()},
+//	    server.WithSigner(ca1Key, ca1Cert),
+//	    server.WithExtraCerts([]*x509.Certificate{ca1Cert}),
 //	    server.WithSecretLookup(ca1SecretLookup),
 //	    server.WithCertificateLookup(ca1CertLookup),
 //	))
-//	mux.Handle("/.well-known/cmp/p/ca2", server.NewCAServer(ca2, ca2Key, ca2Cert,
+//	mux.Handle("/.well-known/cmp/p/ca2", server.NewCAServer(ca2,
 //	    []server.Middleware{server.LightweightPolicy()},
+//	    server.WithSigner(ca2Key, ca2Cert),
+//	    server.WithExtraCerts([]*x509.Certificate{ca2Cert}),
 //	    server.WithSecretLookup(ca2SecretLookup),
 //	    server.WithCertificateLookup(ca2CertLookup),
 //	))

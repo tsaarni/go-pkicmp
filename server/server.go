@@ -219,7 +219,7 @@ func (s *Server) validateHeader(msg *pkicmp.PKIMessage, sender *SenderIdentity) 
 	}
 
 	// RFC 9483 §4.1: Check for duplicate transactionID (scoped to this client's credentials).
-	credID, err := sender.CredentialID()
+	credID, err := sender.credentialID()
 	if err != nil {
 		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadMessageCheck, StatusText: "invalid sender credentials"}
 	}

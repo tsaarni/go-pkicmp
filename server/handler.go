@@ -59,9 +59,9 @@ type SenderIdentity struct {
 	secret []byte
 }
 
-// CredentialID returns a hash identifying the credentials used for protection.
+// credentialID returns a hash identifying the credentials used for protection.
 // Used to verify that follow-up messages use the same credentials per RFC 9483 §3.2.
-func (s *SenderIdentity) CredentialID() ([]byte, error) {
+func (s *SenderIdentity) credentialID() ([]byte, error) {
 	h := sha256.New()
 	if s.MACVerified {
 		h.Write(s.SenderKID)

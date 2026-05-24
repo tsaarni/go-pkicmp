@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -78,7 +79,7 @@ func TestSignatureNotConfigured(t *testing.T) {
 	msg := pkicmp.NewPKIMessage(pkicmp.NewIRBody(&pkicmp.CertReqMessages{
 		{CertReq: pkicmp.CertRequest{CertReqID: 0}},
 	}), macMessageOpts())
-	_ = msg.ProtectWithSignature(clientKey, &clientX509)
+	{ _sc, _ := pkicmp.NewSignatureCredentials(clientKey, &clientX509); _ = _sc.Protect(msg) }
 	msgDER, _ := msg.MarshalBinary()
 
 	resp, err := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
@@ -126,7 +127,7 @@ func TestSignatureVerificationWithBadSigner(t *testing.T) {
 	msg := pkicmp.NewPKIMessage(pkicmp.NewIRBody(&pkicmp.CertReqMessages{
 		{CertReq: pkicmp.CertRequest{CertReqID: 0}},
 	}), macMessageOpts())
-	_ = msg.ProtectWithSignature(clientKey, &clientX509)
+	{ _sc, _ := pkicmp.NewSignatureCredentials(clientKey, &clientX509); _ = _sc.Protect(msg) }
 	msgDER, _ := msg.MarshalBinary()
 
 	resp, err := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
@@ -215,7 +216,7 @@ type pbmac1Creds struct {
 }
 
 func (c *pbmac1Creds) Protect(msg *pkicmp.PKIMessage) error {
-	return msg.ProtectWithPBMAC1(c.secret)
+	{ _mc, _err := pkicmp.NewMACCredentials(c.secret, pkicmp.WithMACAlgorithm(asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14})); if _err != nil { return _err }; return _mc.Protect(msg) }
 }
 
 func (c *pbmac1Creds) SharedSecret() []byte {
