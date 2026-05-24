@@ -6,7 +6,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509/pkix"
-	"encoding/asn1"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -211,12 +210,17 @@ func TestPBMAC1Protection(t *testing.T) {
 }
 
 // pbmac1Creds explicitly uses PBMAC1 protection for testing.
+// PBMAC1 is now the default, so this just wraps NewMACCredentials.
 type pbmac1Creds struct {
 	secret []byte
 }
 
 func (c *pbmac1Creds) Protect(msg *pkicmp.PKIMessage) error {
-	{ _mc, _err := pkicmp.NewMACCredentials(c.secret, pkicmp.WithMACAlgorithm(asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14})); if _err != nil { return _err }; return _mc.Protect(msg) }
+	mc, err := pkicmp.NewMACCredentials(c.secret)
+	if err != nil {
+		return err
+	}
+	return mc.Protect(msg)
 }
 
 func (c *pbmac1Creds) SharedSecret() []byte {

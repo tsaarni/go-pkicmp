@@ -22,16 +22,19 @@ type MACCredentialOption func(*macCredentialConfig)
 type macCredentialConfig struct {
 	algorithm      asn1.ObjectIdentifier
 	iterationCount int
-	owf            asn1.ObjectIdentifier
-	mac            asn1.ObjectIdentifier
 	keyLength      int
-	owfParameters  []byte
-	macParameters  []byte
+	owf            asn1.ObjectIdentifier // PBM OWF or PBMAC1 PRF
+	mac            asn1.ObjectIdentifier
+	owfParameters  []byte // raw ASN.1 params for PBM OWF echo-back
+	macParameters  []byte // raw ASN.1 params for PBM MAC echo-back
+	protectionAlg  *AlgorithmIdentifier  // raw AlgID from WithProtectionAlgorithm
 }
 
-// WithMACAlgorithm sets the top-level MAC algorithm OID (oidPasswordBasedMac or oidPBMAC1).
-func WithMACAlgorithm(oid asn1.ObjectIdentifier) MACCredentialOption {
-	return func(c *macCredentialConfig) { c.algorithm = oid }
+// WithPBM configures legacy PasswordBasedMac protection (RFC 4210 §5.1.3.1).
+// By default, [MACCredentials] uses PBMAC1 (RFC 8018), which is the
+// RECOMMENDED algorithm per RFC 9481 §7.
+func WithPBM() MACCredentialOption {
+	return func(c *macCredentialConfig) { c.algorithm = oidPasswordBasedMac }
 }
 
 // WithMACIterationCount sets the PBKDF iteration count.
@@ -39,29 +42,16 @@ func WithMACIterationCount(n int) MACCredentialOption {
 	return func(c *macCredentialConfig) { c.iterationCount = n }
 }
 
-// WithMAC_OWF sets the one-way function (OWF) algorithm OID for PBM.
-func WithMAC_OWF(oid asn1.ObjectIdentifier) MACCredentialOption { //nolint:revive
-	return func(c *macCredentialConfig) { c.owf = oid }
-}
-
-// WithMAC_MAC sets the MAC algorithm OID.
-func WithMAC_MAC(oid asn1.ObjectIdentifier) MACCredentialOption { //nolint:revive
-	return func(c *macCredentialConfig) { c.mac = oid }
-}
-
-// WithMACKeyLength sets the derived key length (PBMAC1 only).
-func WithMACKeyLength(n int) MACCredentialOption {
-	return func(c *macCredentialConfig) { c.keyLength = n }
-}
-
-// WithMACOWFParameters sets the raw ASN.1 OWF parameters to echo verbatim.
-func WithMACOWFParameters(p []byte) MACCredentialOption {
-	return func(c *macCredentialConfig) { c.owfParameters = p }
-}
-
-// WithMACMACParameters sets the raw ASN.1 MAC parameters to echo verbatim.
-func WithMACMACParameters(p []byte) MACCredentialOption {
-	return func(c *macCredentialConfig) { c.macParameters = p }
+// WithProtectionAlgorithm echoes the protection parameters from a received
+// message's [AlgorithmIdentifier]. The server uses this to protect responses
+// with the same algorithm suite as the request (fresh salt is generated).
+// RFC 9810 §5.1.3.
+func WithProtectionAlgorithm(alg *AlgorithmIdentifier) MACCredentialOption {
+	return func(c *macCredentialConfig) {
+		if alg != nil {
+			c.protectionAlg = alg
+		}
+	}
 }
 
 // MACCredentials holds a shared secret for Password-Based MAC protection.
@@ -74,11 +64,13 @@ type MACCredentials struct {
 	cfg    macCredentialConfig
 }
 
-// NewMACCredentials creates credentials for shared-secret (PBM or PBMAC1) protection.
+// NewMACCredentials creates credentials for shared-secret MAC protection.
 // Returns an error if the secret is empty.
 // The secret is copied — the caller may safely mutate the original slice after this call.
-// By default, PBM (oidPasswordBasedMac) with standard defaults is used.
-// Use [WithMACAlgorithm], [WithMACIterationCount], etc. to override.
+// By default, PBMAC1 (RFC 8018) with HMAC-SHA-256 is used, which is the
+// RECOMMENDED algorithm per RFC 9481 §7. Use [WithPBM] for legacy PasswordBasedMac.
+// Use [WithMACIterationCount] to override the iteration count.
+// Use [WithProtectionAlgorithm] to echo protection parameters from a received message.
 func NewMACCredentials(secret []byte, opts ...MACCredentialOption) (*MACCredentials, error) {
 	if len(secret) == 0 {
 		return nil, &ProtectionError{Reason: ReasonMissingSharedSecret}
@@ -93,9 +85,12 @@ func NewMACCredentials(secret []byte, opts ...MACCredentialOption) (*MACCredenti
 }
 
 func (c *MACCredentials) Protect(msg *PKIMessage) error {
+	if c.cfg.protectionAlg != nil {
+		return msg.protectWithMACAlgorithm(c.secret, c.cfg.protectionAlg)
+	}
 	alg := c.cfg.algorithm
 	if alg == nil {
-		alg = oidPasswordBasedMac
+		alg = oidPBMAC1 // RFC 9481 §7: PBMAC1 is RECOMMENDED over PasswordBasedMac.
 	}
 	if alg.Equal(oidPBMAC1) {
 		return msg.protectWithPBMAC1Options(pbmac1Options{

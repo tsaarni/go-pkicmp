@@ -28,6 +28,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/tsaarni/go-pkicmp/pkicmp"
 )
 
 // transactionKey is a composite key derived from credentialID and transactionID.
@@ -84,9 +86,9 @@ type transactionEntry struct {
 
 	// Set when state == stateIssued
 	cert              *x509.Certificate
-	issuedSenderNonce []byte             // server's senderNonce from the issued response
-	clientSenderNonce []byte             // client's original senderNonce from the cert request
-	macOptions        *macRequestParams // PBM parameters from the client's request
+	issuedSenderNonce []byte                    // server's senderNonce from the issued response
+	clientSenderNonce []byte                    // client's original senderNonce from the cert request
+	protectionParams  pkicmp.MACCredentialOption // decoded protection parameters for echo-back
 }
 
 // transactionTracker manages transaction state for the CMP server.
@@ -194,7 +196,7 @@ func (t *transactionTracker) getPending(credentialID, transactionID []byte) (*tr
 	return entry, true
 }
 
-func (t *transactionTracker) setIssued(credentialID, transactionID []byte, cert *x509.Certificate, senderNonce, clientSenderNonce []byte, macOptions *macRequestParams) bool {
+func (t *transactionTracker) setIssued(credentialID, transactionID []byte, cert *x509.Certificate, senderNonce, clientSenderNonce []byte, protectionParams pkicmp.MACCredentialOption) bool {
 	key := makeKey(credentialID, transactionID)
 	ck := makeCredentialKey(credentialID)
 
@@ -215,7 +217,7 @@ func (t *transactionTracker) setIssued(credentialID, transactionID []byte, cert 
 		cert:              cert,
 		issuedSenderNonce: senderNonce,
 		clientSenderNonce: clientSenderNonce,
-		macOptions:        macOptions,
+		protectionParams:  protectionParams,
 	}
 	return t.transactions.CompareAndSwap(key, old, newEntry)
 }

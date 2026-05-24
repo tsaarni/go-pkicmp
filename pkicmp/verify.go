@@ -58,6 +58,13 @@ type VerifyResult struct {
 	// (PBM, PBMAC1, or KEM-MAC). This determines whether caPubs from the
 	// message body may be trusted (RFC 9810 §5.3.2).
 	MACVerified bool
+
+	// ProtectionParams is a [MACCredentialOption] that captures the decoded
+	// protection parameters from a verified MAC-protected message.
+	// Pass it to [NewMACCredentials] to protect a response with the same
+	// algorithm suite (fresh salt is generated). Nil for signature-verified messages.
+	// RFC 9810 §5.1.3.
+	ProtectionParams MACCredentialOption
 }
 
 // Verify verifies the message protection and returns verification metadata.
@@ -143,7 +150,17 @@ func (m *PKIMessage) verifyPBM(opts VerifyOptions) (*VerifyResult, error) {
 		return nil, &VerificationError{Reason: ReasonBadMAC}
 	}
 
-	return &VerifyResult{MACVerified: true}, nil
+	return &VerifyResult{
+		MACVerified: true,
+		ProtectionParams: func(c *macCredentialConfig) {
+			c.algorithm = oidPasswordBasedMac
+			c.iterationCount = p.IterationCount
+			c.owf = p.OWF.Algorithm
+			c.mac = p.MAC.Algorithm
+			c.owfParameters = p.OWF.Parameters
+			c.macParameters = p.MAC.Parameters
+		},
+	}, nil
 }
 
 // verifyPBMAC1 verifies PBMAC1 protection.
@@ -206,7 +223,16 @@ func (m *PKIMessage) verifyPBMAC1(opts VerifyOptions) (*VerifyResult, error) {
 		return nil, &VerificationError{Reason: ReasonBadMAC}
 	}
 
-	return &VerifyResult{MACVerified: true}, nil
+	return &VerifyResult{
+		MACVerified: true,
+		ProtectionParams: func(c *macCredentialConfig) {
+			c.algorithm = oidPBMAC1
+			c.iterationCount = pbkdf2Params.IterationCount
+			c.keyLength = pbkdf2Params.KeyLength
+			c.owf = pbkdf2Params.PRF.Algorithm
+			c.mac = pbmac1Params.MessageAuthScheme.Algorithm
+		},
+	}, nil
 }
 
 // verifySignature verifies signature-based protection.

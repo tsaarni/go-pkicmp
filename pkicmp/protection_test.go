@@ -18,16 +18,6 @@ import (
 	"github.com/tsaarni/go-pkicmp/pkicmp"
 )
 
-func mustCreds(secret []byte) *pkicmp.MACCredentials {
-	c, _ := pkicmp.NewMACCredentials(secret)
-	return c
-}
-
-func mustCredsPBMAC1(secret []byte) *pkicmp.MACCredentials {
-	c, _ := pkicmp.NewMACCredentials(secret, pkicmp.WithMACAlgorithm(asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14}))
-	return c
-}
-
 func mustProtectMAC(t *testing.T, msg *pkicmp.PKIMessage, secret []byte) {
 	t.Helper()
 	mc, err := pkicmp.NewMACCredentials(secret)
@@ -55,7 +45,7 @@ func TestPBMRoundTrip(t *testing.T) {
 	body := pkicmp.NewPKIConfBody()
 	msg := pkicmp.NewPKIMessage(body, pkicmp.MessageOptions{})
 
-	mc, err := pkicmp.NewMACCredentials(secret)
+	mc, err := pkicmp.NewMACCredentials(secret, pkicmp.WithPBM())
 	require.NoError(t, err)
 	err = mc.Protect(msg)
 	require.NoError(t, err)
@@ -78,22 +68,25 @@ func TestPBMRoundTrip(t *testing.T) {
 func TestPBMCustomOptions(t *testing.T) {
 	secret := []byte("custom-secret")
 
+	// First, create a PBM-protected message with defaults.
 	body := pkicmp.NewPKIConfBody()
-	msg := pkicmp.NewPKIMessage(body, pkicmp.MessageOptions{})
-
-	mc, err := pkicmp.NewMACCredentials(secret,
-		pkicmp.WithMACAlgorithm(asn1.ObjectIdentifier{1, 2, 840, 113533, 7, 66, 13}),
-		pkicmp.WithMACIterationCount(5000),
-		pkicmp.WithMAC_OWF(asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 3}),
-		pkicmp.WithMAC_MAC(asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 11}),
-	)
+	msg1 := pkicmp.NewPKIMessage(body, pkicmp.MessageOptions{})
+	mc1, err := pkicmp.NewMACCredentials(secret, pkicmp.WithPBM(), pkicmp.WithMACIterationCount(5000))
 	require.NoError(t, err)
-	err = mc.Protect(msg)
+	err = mc1.Protect(msg1)
 	require.NoError(t, err)
 
-	assert.Equal(t, asn1.ObjectIdentifier{1, 2, 840, 113533, 7, 66, 13}, msg.Header.ProtectionAlg.Algorithm)
+	// Echo-back: create new credentials from the protection algorithm of the first message.
+	body2 := pkicmp.NewPKIConfBody()
+	msg2 := pkicmp.NewPKIMessage(body2, pkicmp.MessageOptions{})
+	mc2, err := pkicmp.NewMACCredentials(secret, pkicmp.WithProtectionAlgorithm(msg1.Header.ProtectionAlg))
+	require.NoError(t, err)
+	err = mc2.Protect(msg2)
+	require.NoError(t, err)
 
-	der, err := msg.MarshalBinary()
+	assert.Equal(t, asn1.ObjectIdentifier{1, 2, 840, 113533, 7, 66, 13}, msg2.Header.ProtectionAlg.Algorithm)
+
+	der, err := msg2.MarshalBinary()
 	require.NoError(t, err)
 
 	parsed, err := pkicmp.ParsePKIMessage(der)
@@ -110,7 +103,8 @@ func TestPBMAC1RoundTrip(t *testing.T) {
 	body := pkicmp.NewPKIConfBody()
 	msg := pkicmp.NewPKIMessage(body, pkicmp.MessageOptions{})
 
-	mc, err := pkicmp.NewMACCredentials(secret, pkicmp.WithMACAlgorithm(asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14}))
+	// PBMAC1 is the default per RFC 9481 §7.
+	mc, err := pkicmp.NewMACCredentials(secret)
 	require.NoError(t, err)
 	err = mc.Protect(msg)
 	require.NoError(t, err)
@@ -132,22 +126,25 @@ func TestPBMAC1RoundTrip(t *testing.T) {
 func TestPBMAC1CustomOptions(t *testing.T) {
 	secret := []byte("custom-secret")
 
+	// First, create a PBMAC1-protected message with custom iteration count.
 	body := pkicmp.NewPKIConfBody()
-	msg := pkicmp.NewPKIMessage(body, pkicmp.MessageOptions{})
-
-	mc, err := pkicmp.NewMACCredentials(secret,
-		pkicmp.WithMACAlgorithm(asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14}),
-		pkicmp.WithMACIterationCount(5000),
-		pkicmp.WithMAC_OWF(asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 11}),
-		pkicmp.WithMAC_MAC(asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 11}),
-	)
+	msg1 := pkicmp.NewPKIMessage(body, pkicmp.MessageOptions{})
+	mc1, err := pkicmp.NewMACCredentials(secret, pkicmp.WithMACIterationCount(5000))
 	require.NoError(t, err)
-	err = mc.Protect(msg)
+	err = mc1.Protect(msg1)
 	require.NoError(t, err)
 
-	assert.Equal(t, asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14}, msg.Header.ProtectionAlg.Algorithm)
+	// Echo-back: create new credentials from the protection algorithm of the first message.
+	body2 := pkicmp.NewPKIConfBody()
+	msg2 := pkicmp.NewPKIMessage(body2, pkicmp.MessageOptions{})
+	mc2, err := pkicmp.NewMACCredentials(secret, pkicmp.WithProtectionAlgorithm(msg1.Header.ProtectionAlg))
+	require.NoError(t, err)
+	err = mc2.Protect(msg2)
+	require.NoError(t, err)
 
-	der, err := msg.MarshalBinary()
+	assert.Equal(t, asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14}, msg2.Header.ProtectionAlg.Algorithm)
+
+	der, err := msg2.MarshalBinary()
 	require.NoError(t, err)
 
 	parsed, err := pkicmp.ParsePKIMessage(der)
@@ -161,7 +158,7 @@ func TestPBMAC1CustomOptions(t *testing.T) {
 func TestPBMAC1WrongSecret(t *testing.T) {
 	body := pkicmp.NewPKIConfBody()
 	msg := pkicmp.NewPKIMessage(body, pkicmp.MessageOptions{})
-	mustProtectMACOpts(t, msg, []byte("correct-secret"), pkicmp.WithMACAlgorithm(asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14}))
+	mustProtectMAC(t, msg, []byte("correct-secret"))
 
 	der, err := msg.MarshalBinary()
 	require.NoError(t, err)

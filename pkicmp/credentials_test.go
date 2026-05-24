@@ -113,7 +113,7 @@ func TestProtectWithCredentials(t *testing.T) {
 		err := creds.Protect(msg)
 		require.NoError(t, err)
 		assert.NotEmpty(t, msg.Protection)
-		assert.Equal(t, asn1.ObjectIdentifier{1, 2, 840, 113533, 7, 66, 13}, msg.Header.ProtectionAlg.Algorithm)
+		assert.Equal(t, asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 14}, msg.Header.ProtectionAlg.Algorithm)
 	})
 
 	t.Run("Signature", func(t *testing.T) {

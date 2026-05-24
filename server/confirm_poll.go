@@ -129,7 +129,7 @@ func (s *Server) handleCertConf(ctx context.Context, msg *pkicmp.PKIMessage, sen
 	ctx = context.WithValue(ctx, issuedCertContextKey{}, entry.cert)
 	_, _ = s.handler.HandleCMP(ctx, msg, sender)
 
-	return s.buildResponseWithMACOptions(msg, pkicmp.NewPKIConfBody(), sender, entry.macOptions)
+	return s.buildResponseWithEchoProtection(msg, pkicmp.NewPKIConfBody(), sender, entry.protectionParams)
 }
 
 // computeCertHash computes the certificate hash using the hash algorithm

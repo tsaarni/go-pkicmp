@@ -124,6 +124,57 @@ func (m *PKIMessage) protectWithMACOptions(opts macOptions) error {
 	return nil
 }
 
+// protectWithMACAlgorithm protects the message by echoing the algorithm
+// parameters from a received message (with a fresh salt). Used by servers
+// to match the request's protection suite. RFC 9810 §5.1.3.
+func (m *PKIMessage) protectWithMACAlgorithm(secret []byte, alg *AlgorithmIdentifier) error {
+	if alg.Algorithm.Equal(oidPBMAC1) {
+		var params struct {
+			KeyDerivationFunc algorithmIdentifierASN1
+			MessageAuthScheme algorithmIdentifierASN1
+		}
+		if _, err := asn1.Unmarshal(alg.Parameters, &params); err != nil {
+			return &ParseError{Detail: "invalid PBMAC1-params: " + err.Error()}
+		}
+		if !params.KeyDerivationFunc.Algorithm.Equal(oidPBKDF2) {
+			return &ParseError{Detail: fmt.Sprintf("unsupported KDF: %v", params.KeyDerivationFunc.Algorithm)}
+		}
+		var kdfParams struct {
+			Salt           []byte
+			IterationCount int
+			KeyLength      int
+			PRF            algorithmIdentifierASN1
+		}
+		if _, err := asn1.Unmarshal(params.KeyDerivationFunc.Parameters.FullBytes, &kdfParams); err != nil {
+			return &ParseError{Detail: "invalid PBKDF2-params: " + err.Error()}
+		}
+		return m.protectWithPBMAC1Options(pbmac1Options{
+			Secret:         secret,
+			IterationCount: kdfParams.IterationCount,
+			KeyLength:      kdfParams.KeyLength,
+			PRF:            kdfParams.PRF.Algorithm,
+			MAC:            params.MessageAuthScheme.Algorithm,
+		})
+	}
+	if alg.Algorithm.Equal(oidPasswordBasedMac) {
+		var p pbmParameter
+		params := cryptobyte.String(alg.Parameters)
+		if err := p.unmarshal(&params); err != nil {
+			return err
+		}
+		return m.protectWithMACOptions(macOptions{
+			Secret:         secret,
+			Algorithm:      alg.Algorithm,
+			IterationCount: p.IterationCount,
+			OWF:            p.OWF.Algorithm,
+			MAC:            p.MAC.Algorithm,
+			OWFParameters:  p.OWF.Parameters,
+			MACParameters:  p.MAC.Parameters,
+		})
+	}
+	return &ParseError{Detail: fmt.Sprintf("unsupported MAC algorithm: %v", alg.Algorithm)}
+}
+
 // pbmac1Options configures PBMAC1 protection (RFC 8018 §7.1, RFC 9481 §6.1.2).
 type pbmac1Options struct {
 	Secret         []byte

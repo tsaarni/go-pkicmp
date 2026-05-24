@@ -28,8 +28,8 @@
 // [NewSignatureCredentials]). The sealed interface makes it impossible to
 // accidentally mix protection modes.
 //
-// For lower-level control, [PKIMessage.ProtectWithMAC] and
-// [PKIMessage.ProtectWithSignature] are also available.
+// By default, [MACCredentials] uses PBMAC1 (RFC 8018), which is the RECOMMENDED
+// algorithm per RFC 9481 §7. Use [WithPBM] for legacy PasswordBasedMac.
 //
 // [PKIMessage.Verify] verifies the protection of a received message. Pass
 // [VerifyOptions] with either a shared secret (for MAC) or a [crypto/x509.CertPool]

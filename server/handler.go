@@ -57,6 +57,10 @@ type SenderIdentity struct {
 	// secret is the verified shared secret, cached to avoid redundant lookups
 	// when protecting the response.
 	secret []byte
+
+	// protectionParams captures the decoded MAC parameters from the verified
+	// request, used to protect responses with the same algorithm suite.
+	protectionParams pkicmp.MACCredentialOption
 }
 
 // credentialID returns a hash identifying the credentials used for protection.
