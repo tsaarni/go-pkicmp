@@ -184,11 +184,16 @@ func (s *Server) handleCertRequestNew(ctx context.Context, msg *pkicmp.PKIMessag
 
 	if resp.Certificate != nil {
 		if s.cfg.implicitConfirm && requestHasImplicitConfirm(msg) {
-			// No CertConf will arrive — mark transaction completed but keep it
-			// to block duplicate transactionIDs until cleanup.
+			// Mark the transaction completed but keep it in the table until
+			// cleanupExpired runs, so the transactionID cannot be reused within
+			// the same confirmWaitTime window (RFC 9483 §3.5).
 			s.setCompleted(credID, txnID)
+			// Notify the CA that the certificate was implicitly confirmed.
+			if s.cfg.confirmer != nil {
+				_ = s.cfg.confirmer.ConfirmCertificate(ctx, resp.Certificate, ConfirmImplicit, resp.IssueRef)
+			}
 		} else {
-			if !s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, protectionParams) {
+			if !s.setIssued(credID, txnID, resp.Certificate, resp.IssueRef, respMsg.Header.SenderNonce, msg.Header.SenderNonce, protectionParams) {
 				return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
 					Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailTransactionIdInUse,
 				})
@@ -286,11 +291,16 @@ func (s *Server) handlePollReqNew(ctx context.Context, msg *pkicmp.PKIMessage, s
 
 	if resp.Certificate != nil {
 		if s.cfg.implicitConfirm && requestHasImplicitConfirm(msg) {
-			// No CertConf will arrive — mark transaction completed but keep it
-			// to block duplicate transactionIDs until cleanup.
+			// Mark the transaction completed but keep it in the table until
+			// cleanupExpired runs, so the transactionID cannot be reused within
+			// the same confirmWaitTime window (RFC 9483 §3.5).
 			s.setCompleted(credID, txnID)
+			// Notify the CA that the certificate was implicitly confirmed.
+			if s.cfg.confirmer != nil {
+				_ = s.cfg.confirmer.ConfirmCertificate(ctx, resp.Certificate, ConfirmImplicit, resp.IssueRef)
+			}
 		} else {
-			if !s.setIssued(credID, txnID, resp.Certificate, respMsg.Header.SenderNonce, msg.Header.SenderNonce, sender.protectionParams) {
+			if !s.setIssued(credID, txnID, resp.Certificate, resp.IssueRef, respMsg.Header.SenderNonce, msg.Header.SenderNonce, sender.protectionParams) {
 				return s.buildErrorResponse(msg, pkicmp.PKIStatusInfo{
 					Status: pkicmp.StatusRejection, FailInfo: pkicmp.FailTransactionIdInUse,
 				})

@@ -40,6 +40,16 @@ type Response struct {
 	Certificate *x509.Certificate
 	CACerts     []*x509.Certificate
 	Waiting     *WaitingResponse
+	// IssueRef is an opaque value set by the CA during issuance and passed back
+	// to [CertificateConfirmer.ConfirmCertificate] when the certificate is
+	// confirmed, rejected, or expires. Use it to correlate the confirmation
+	// with the original issuance (e.g., a database row ID or job reference):
+	//
+	//     return &server.Response{
+	//         Certificate: cert,
+	//         IssueRef:    dbRowID,
+	//     }, nil
+	IssueRef any
 }
 
 // SenderIdentity represents the authenticated message sender.

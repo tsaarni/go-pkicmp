@@ -78,7 +78,10 @@ func TestSignatureNotConfigured(t *testing.T) {
 	msg := pkicmp.NewPKIMessage(pkicmp.NewIRBody(&pkicmp.CertReqMessages{
 		{CertReq: pkicmp.CertRequest{CertReqID: 0}},
 	}), macMessageOpts())
-	{ _sc, _ := pkicmp.NewSignatureCredentials(clientKey, &clientX509); _ = _sc.Protect(msg) }
+	{
+		_sc, _ := pkicmp.NewSignatureCredentials(clientKey, &clientX509)
+		_ = _sc.Protect(msg)
+	}
 	msgDER, _ := msg.MarshalBinary()
 
 	resp, err := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
@@ -126,7 +129,10 @@ func TestSignatureVerificationWithBadSigner(t *testing.T) {
 	msg := pkicmp.NewPKIMessage(pkicmp.NewIRBody(&pkicmp.CertReqMessages{
 		{CertReq: pkicmp.CertRequest{CertReqID: 0}},
 	}), macMessageOpts())
-	{ _sc, _ := pkicmp.NewSignatureCredentials(clientKey, &clientX509); _ = _sc.Protect(msg) }
+	{
+		_sc, _ := pkicmp.NewSignatureCredentials(clientKey, &clientX509)
+		_ = _sc.Protect(msg)
+	}
 	msgDER, _ := msg.MarshalBinary()
 
 	resp, err := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
@@ -181,7 +187,6 @@ func TestMACLookupReturnsError(t *testing.T) {
 	respMsg, _ := pkicmp.ParsePKIMessage(buf[:n])
 	assert.Equal(t, pkicmp.BodyTypeError, respMsg.Body.Type)
 }
-
 
 func TestPBMAC1Protection(t *testing.T) {
 	secret := []byte("pbmac1-secret")

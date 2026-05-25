@@ -151,4 +151,3 @@ func TestProtectWithCredentials(t *testing.T) {
 		assert.Equal(t, asn1.ObjectIdentifier{1, 2, 840, 10045, 4, 3, 2}, msg.Header.ProtectionAlg.Algorithm)
 	})
 }
-

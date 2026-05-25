@@ -34,17 +34,25 @@ func main() {
 	//   - WithSigner: signs every outgoing response with the CA key; a crypto.Signer
 	//     so an HSM-backed signer can be used in production.
 	//   - WithExtraCerts: appends the CA cert to outgoing response extraCerts.
-	//   - WithImplicitConfirm: skips the certConf/PKIConf round-trip.
+	//   - WithConfirmWaitTime: how long to keep transactions waiting for certConf
+	//   - WithConfirmWaitTime: how long to keep transactions waiting for certConf
+	//     before CleanupExpired considers them stale. Default is 10 seconds.
 	//   - WithSecretLookup: enables MAC (shared-secret) protection for IR/CR.
 	//   - WithCertificateLookup: enables signature protection for KUR/certConf.
 	srv := server.NewCAServer(ca,
 		[]server.Middleware{server.LightweightPolicy()},
 		server.WithSigner(ca.Key(), ca.Cert()),
 		server.WithExtraCerts([]*x509.Certificate{ca.Cert()}),
-		server.WithImplicitConfirm(),
 		server.WithSecretLookup(ca),
 		server.WithCertificateLookup(ca),
 	)
+
+	// Periodically remove stale transactions from clients that never send certConf.
+	go func() {
+		for range time.Tick(30 * time.Second) {
+			srv.CleanupExpired()
+		}
+	}()
 
 	mux := http.NewServeMux()
 	mux.Handle("/cmp", srv)

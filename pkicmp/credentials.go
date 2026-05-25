@@ -25,12 +25,12 @@ type macCredentialConfig struct {
 	keyLength      int
 	owf            asn1.ObjectIdentifier // PBM OWF or PBMAC1 PRF
 	mac            asn1.ObjectIdentifier
-	owfParameters  []byte // raw ASN.1 params for PBM OWF echo-back
-	macParameters  []byte // raw ASN.1 params for PBM MAC echo-back
-	protectionAlg  *AlgorithmIdentifier  // raw AlgID from WithProtectionAlgorithm
+	owfParameters  []byte               // raw ASN.1 params for PBM OWF echo-back
+	macParameters  []byte               // raw ASN.1 params for PBM MAC echo-back
+	protectionAlg  *AlgorithmIdentifier // raw AlgID from WithProtectionAlgorithm
 }
 
-// WithPBM configures legacy PasswordBasedMac protection (RFC 4210 §5.1.3.1).
+// WithPBM configures PasswordBasedMac protection (RFC 4210 §5.1.3.1).
 // By default, [MACCredentials] uses PBMAC1 (RFC 8018), which is the
 // RECOMMENDED algorithm per RFC 9481 §7.
 func WithPBM() MACCredentialOption {
@@ -68,7 +68,7 @@ type MACCredentials struct {
 // Returns an error if the secret is empty.
 // The secret is copied — the caller may safely mutate the original slice after this call.
 // By default, PBMAC1 (RFC 8018) with HMAC-SHA-256 is used, which is the
-// RECOMMENDED algorithm per RFC 9481 §7. Use [WithPBM] for legacy PasswordBasedMac.
+// RECOMMENDED algorithm per RFC 9481 §7. Use [WithPBM] for PasswordBasedMac.
 // Use [WithMACIterationCount] to override the iteration count.
 // Use [WithProtectionAlgorithm] to echo protection parameters from a received message.
 func NewMACCredentials(secret []byte, opts ...MACCredentialOption) (*MACCredentials, error) {
@@ -152,4 +152,3 @@ func (c *SignatureCredentials) Certificate() *x509.Certificate {
 func (c *SignatureCredentials) Protect(msg *PKIMessage) error {
 	return msg.protectWithSignature(c.key, c.cert, c.chain...)
 }
-

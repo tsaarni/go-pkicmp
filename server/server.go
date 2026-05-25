@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/tsaarni/go-pkicmp/pkicmp"
 )
@@ -28,6 +29,9 @@ func New(handler Handler, opts ...Option) *Server {
 	s := &Server{handler: handler}
 	for _, o := range opts {
 		o(&s.cfg)
+	}
+	if s.cfg.confirmWait == 0 {
+		s.cfg.confirmWait = 10 * time.Second
 	}
 	maxTxn := s.cfg.maxTransactions
 	if maxTxn == 0 {
@@ -157,9 +161,19 @@ func (s *Server) processMessage(ctx context.Context, msg *pkicmp.PKIMessage) *pk
 }
 
 // CleanupExpired removes pending transactions and issued certificates that
-// have exceeded the configured confirmWaitTime. Call this periodically.
+// have exceeded the configured confirmWaitTime (default 10s). Call this
+// periodically.
+//
+// If the CA implements [CertificateConfirmer], it is notified with
+// [ConfirmExpired] for each issued certificate that timed out without
+// receiving a certConf message.
 func (s *Server) CleanupExpired() {
-	s.transactionTracker.cleanupExpired(s.cfg.confirmWait)
+	expired := s.transactionTracker.cleanupExpired(s.cfg.confirmWait)
+	if s.cfg.confirmer != nil {
+		for _, e := range expired {
+			_ = s.cfg.confirmer.ConfirmCertificate(context.Background(), e.cert, ConfirmExpired, e.issueRef)
+		}
+	}
 }
 
 // verifyRecipient checks that the recipient field in the request matches the

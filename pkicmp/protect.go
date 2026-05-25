@@ -281,7 +281,7 @@ func marshalPBMAC1Params(salt []byte, iterCount, keyLen int, prf, mac asn1.Objec
 		KeyDerivationFunc algorithmIdentifierASN1
 		MessageAuthScheme algorithmIdentifierASN1
 	}{
-	KeyDerivationFunc: algorithmIdentifierASN1{Algorithm: oidPBKDF2, Parameters: asn1.RawValue{FullBytes: pbkdf2Params}},
+		KeyDerivationFunc: algorithmIdentifierASN1{Algorithm: oidPBKDF2, Parameters: asn1.RawValue{FullBytes: pbkdf2Params}},
 		MessageAuthScheme: algorithmIdentifierASN1{Algorithm: mac},
 	})
 }
