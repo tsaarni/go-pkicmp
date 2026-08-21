@@ -2,10 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/asn1"
-	"errors"
 
 	"github.com/tsaarni/go-pkicmp/pkicmp"
 )
@@ -15,35 +11,29 @@ import (
 func LightweightPolicy() func(Handler) Handler {
 	return func(next Handler) Handler {
 		return HandlerFunc(func(ctx context.Context, msg *pkicmp.PKIMessage, sender *SenderIdentity) (*Response, error) {
-			// RFC 9483 §3.1: MAC-protected messages MUST use directoryName in the sender field.
-			if sender.MACVerified && len(msg.Header.Sender.DirectoryName) == 0 {
+			// RFC 9483 §3.1 wants a MAC-protected message to name the shared
+			// secret in the sender commonName, but RFC 4210 §5.1.1 requires the
+			// opposite of an end entity that does not yet know its own name: a
+			// NULL-DN sender with the reference number in senderKID, which is
+			// what a bootstrapping enrollment normally is. Either form
+			// identifies the secret, so only the absence of both is rejected
+			// here. WithStrictProfileValidation applies the profile rule.
+			if sender.MACVerified && len(msg.Header.Sender.DirectoryName) == 0 && len(msg.Header.SenderKID) == 0 {
 				return nil, &Error{
 					Status:      pkicmp.StatusRejection,
 					FailureInfo: pkicmp.FailBadMessageCheck,
-					StatusText:  "MAC protection requires directoryName sender",
+					StatusText:  "MAC protection requires a sender name or senderKID",
 				}
 			}
 
-			// RFC 9483 §3.3: Signature-protected messages MUST include extraCerts.
-			if !sender.MACVerified && len(msg.ExtraCerts) == 0 {
-				return nil, &Error{
-					Status:      pkicmp.StatusRejection,
-					FailureInfo: pkicmp.FailBadMessageCheck,
-					StatusText:  "signature protection without extraCerts",
-				}
-			}
-
-			// RFC 9483 §3.5: For initial requests, extraCerts MUST contain the
-			// complete certificate chain (signer cert + issuing CA certs).
-			if !sender.MACVerified && isInitialRequest(msg.Body.Type) {
-				if err := validateExtraCertsChain(msg.ExtraCerts); err != nil {
-					return nil, &Error{
-						Status:      pkicmp.StatusRejection,
-						FailureInfo: pkicmp.FailBadMessageCheck,
-						StatusText:  "incomplete certificate chain in extraCerts",
-					}
-				}
-			}
+			// The RFC 9483 §3.3 rules on extraCerts, that it is present for
+			// signature-based protection and that the CMP protection certificate
+			// comes first, are enforced only under WithStrictProfileValidation.
+			// They exist so a recipient can resolve and validate the signer from
+			// the message, and this server never does that: it authenticates
+			// through CertificateLookup against its own store. Enforcing them by
+			// default would reject deployed clients over a field the server
+			// ignores. Outgoing responses always follow §3.3.
 
 			// Only validate cert requests further.
 			if !isCertRequest(msg.Body.Type) {
@@ -89,45 +79,17 @@ func validateP10CR(msg *pkicmp.PKIMessage) error {
 	if err != nil {
 		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadDataFormat}
 	}
-	// Verify CSR signature.
-	if err := csr.CheckSignature(); err != nil {
-		if errors.Is(err, x509.ErrUnsupportedAlgorithm) {
-			return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadAlg, StatusText: "unsupported signature algorithm"}
-		}
-		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadPOP, StatusText: err.Error()}
+	// RFC 4211 §4: the CSR self-signature proves possession of the key.
+	if err := enforceProofOfPossession(msg); err != nil {
+		return err
 	}
 	// RFC 9483 §4.1.1: Subject required.
 	if len(csr.Subject.String()) == 0 {
 		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadCertTemplate, StatusText: "subject required"}
 	}
-	// RFC 5280 §4.2.1.9: Validate BasicConstraints path-length.
-	if err := validateBasicConstraints(csr.Extensions); err != nil {
-		return err
-	}
-	// Policy: Reject requests for CA certificates.
-		if hasCABasicConstraints(csr.Extensions) {
-		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailNotAuthorized, StatusText: "CA certificates not allowed"}
-	}
-	return nil
-}
-
-// validateBasicConstraints checks RFC 5280 §4.2.1.9 constraints on path-length.
-func validateBasicConstraints(extensions []pkix.Extension) error {
-	oidBasicConstraints := asn1.ObjectIdentifier{2, 5, 29, 19}
-	for _, ext := range extensions {
-		if ext.Id.Equal(oidBasicConstraints) {
-			var bc struct {
-				IsCA       bool `asn1:"optional"`
-				MaxPathLen int  `asn1:"optional"`
-			}
-			if rest, err := asn1.Unmarshal(ext.Value, &bc); err == nil && len(rest) == 0 {
-				if bc.MaxPathLen < 0 || (!bc.IsCA && bc.MaxPathLen != 0) {
-					return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadCertTemplate, StatusText: "invalid path-length in BasicConstraints"}
-				}
-			}
-		}
-	}
-	return nil
+	// RFC 5280 §4.2.1.9 path-length rules, plus the policy decision to refuse a
+	// request for a CA certificate.
+	return checkBasicConstraints(csr.Extensions)
 }
 
 func validateCRMF(msg *pkicmp.PKIMessage) error {
@@ -141,20 +103,10 @@ func validateCRMF(msg *pkicmp.PKIMessage) error {
 		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadRequest, StatusText: "certReqId must be 0"}
 	}
 
-	// RFC 4211 §4: Verify POP.
-	if err := verifyPOPMsg(msg); err != nil {
-		failInfo := pkicmp.FailBadPOP
-		// RFC 9810 §5.2.8.1: An end entity MUST NOT use raVerified.
-		var parseErr *pkicmp.ParseError
-		if errors.As(err, &parseErr) && parseErr.Detail == "raVerified POP not supported" {
-			failInfo = pkicmp.FailNotAuthorized
-		}
-		return &Error{Status: pkicmp.StatusRejection, FailureInfo: failInfo, StatusText: err.Error()}
-	}
-
-	// RFC 9483 §5.1.1: POP required for signature-capable keys.
-	if crmf.popRequired && crmf.popMissing {
-		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadPOP, StatusText: "POP required for signature key"}
+	// RFC 4211 §4 and RFC 9483 §5.1.1: the request must prove possession of the
+	// requested key.
+	if err := enforceProofOfPossession(msg); err != nil {
+		return err
 	}
 
 	// RFC 9483 §4.1.1: Subject required.
@@ -162,15 +114,7 @@ func validateCRMF(msg *pkicmp.PKIMessage) error {
 		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailBadCertTemplate, StatusText: "subject required"}
 	}
 
-	// RFC 5280 §4.2.1.9: Validate BasicConstraints path-length.
-	if err := validateBasicConstraints(crmf.extensions); err != nil {
-		return err
-	}
-
-	// Policy: Reject requests for CA certificates.
-	if hasCABasicConstraints(crmf.extensions) {
-		return &Error{Status: pkicmp.StatusRejection, FailureInfo: pkicmp.FailNotAuthorized, StatusText: "CA certificates not allowed"}
-	}
-
-	return nil
+	// RFC 5280 §4.2.1.9 path-length rules, plus the policy decision to refuse a
+	// request for a CA certificate.
+	return checkBasicConstraints(crmf.extensions)
 }

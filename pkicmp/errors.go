@@ -22,6 +22,20 @@ const (
 	ReasonSignatureFailed
 	// ReasonMissingTrustAnchors indicates no trust anchors were provided for signature verification.
 	ReasonMissingTrustAnchors
+	// ReasonUnexpectedProtection indicates the message used a different protection
+	// mechanism than the caller required. RFC 9810 §5.2.3 defines the matching
+	// failInfo bit wrongIntegrity, "password based instead of signature or vice versa".
+	ReasonUnexpectedProtection
+	// ReasonSenderMismatch indicates the protection certificate subject does not
+	// match the sender named in the header (RFC 9483 §3.5).
+	ReasonSenderMismatch
+	// ReasonKeyUsageNotPermitted indicates the CMP protection certificate carries
+	// a keyUsage extension without the digitalSignature bit, which RFC 9483 §3.5
+	// requires for signature-based protection.
+	ReasonKeyUsageNotPermitted
+	// ReasonCertificateExpired indicates the CMP protection certificate is outside
+	// its validity period.
+	ReasonCertificateExpired
 )
 
 func (r InvalidReason) String() string {
@@ -38,6 +52,14 @@ func (r InvalidReason) String() string {
 		return "signature verification failed"
 	case ReasonMissingTrustAnchors:
 		return "missing trust anchors"
+	case ReasonUnexpectedProtection:
+		return "unexpected protection mechanism"
+	case ReasonSenderMismatch:
+		return "sender does not match protection certificate subject"
+	case ReasonKeyUsageNotPermitted:
+		return "protection certificate is not permitted to sign"
+	case ReasonCertificateExpired:
+		return "protection certificate is outside its validity period"
 	default:
 		return "unknown"
 	}

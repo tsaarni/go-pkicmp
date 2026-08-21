@@ -29,8 +29,12 @@ func TestPolling(t *testing.T) {
 	secret := []byte("poll-secret")
 
 	pollCount := 0
+	// The deferred certificate must be issued for the key the request carried,
+	// so the requested key is captured here and used once polling completes.
+	var requestedKey crypto.PublicKey
 	handler := &mockHandler{
 		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			requestedKey = req.PublicKey
 			return &certResponse{
 				Waiting: &server.WaitingResponse{CheckAfter: 1 * time.Second, Reason: "processing"},
 			}, nil
@@ -51,8 +55,7 @@ func TestPolling(t *testing.T) {
 				NotBefore:    time.Now(),
 				NotAfter:     time.Now().Add(24 * time.Hour),
 			}
-			pub, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-			certDER, _ := x509.CreateCertificate(rand.Reader, tmpl, &caCertX509, &pub.PublicKey, caKey)
+			certDER, _ := x509.CreateCertificate(rand.Reader, tmpl, &caCertX509, requestedKey, caKey)
 			cert, _ := x509.ParseCertificate(certDER)
 			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
@@ -463,8 +466,10 @@ func TestPollReqWithCertReady(t *testing.T) {
 	caCert, _ := ca.X509Certificate()
 	secret := []byte("poll-ready")
 
+	var requestedKey crypto.PublicKey
 	handler := &mockHandler{
 		handleCertRequest: func(ctx context.Context, req *certRequest) (*certResponse, error) {
+			requestedKey = req.PublicKey
 			return &certResponse{
 				Waiting: &server.WaitingResponse{CheckAfter: 0},
 			}, nil
@@ -479,8 +484,7 @@ func TestPollReqWithCertReady(t *testing.T) {
 				NotBefore:    time.Now(),
 				NotAfter:     time.Now().Add(24 * time.Hour),
 			}
-			pub, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-			certDER, _ := x509.CreateCertificate(rand.Reader, tmpl, &caCertX509, &pub.PublicKey, caKey)
+			certDER, _ := x509.CreateCertificate(rand.Reader, tmpl, &caCertX509, requestedKey, caKey)
 			cert, _ := x509.ParseCertificate(certDER)
 			return &certResponse{Certificate: cert, CACerts: []*x509.Certificate{&caCert}}, nil
 		},
@@ -540,7 +544,10 @@ func TestCertConfWithDifferentCredentials(t *testing.T) {
 		Recipient: pkicmp.NewDirectoryName(pkix.Name{CommonName: "Test CA"}),
 	})
 	msg.Header.SenderKID = []byte("kid1")
-	{ _mc, _ := pkicmp.NewMACCredentials(secret1); _ = _mc.Protect(msg) }
+	{
+		_mc, _ := pkicmp.NewMACCredentials(secret1)
+		_ = _mc.Protect(msg)
+	}
 	msgDER, _ := msg.MarshalBinary()
 
 	resp, _ := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
@@ -558,7 +565,10 @@ func TestCertConfWithDifferentCredentials(t *testing.T) {
 	confMsg.Header.TransactionID = msg.Header.TransactionID
 	confMsg.Header.RecipNonce = respMsg.Header.SenderNonce
 	confMsg.Header.SenderKID = []byte("kid2")
-	{ _mc, _ := pkicmp.NewMACCredentials(secret2); _ = _mc.Protect(confMsg) }
+	{
+		_mc, _ := pkicmp.NewMACCredentials(secret2)
+		_ = _mc.Protect(confMsg)
+	}
 	confDER, _ := confMsg.MarshalBinary()
 
 	resp2, _ := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(confDER)))
@@ -605,7 +615,10 @@ func TestPollReqWithDifferentCredentials(t *testing.T) {
 		Recipient: pkicmp.NewDirectoryName(pkix.Name{CommonName: "Test CA"}),
 	})
 	msg.Header.SenderKID = []byte("kid1")
-	{ _mc, _ := pkicmp.NewMACCredentials(secret1); _ = _mc.Protect(msg) }
+	{
+		_mc, _ := pkicmp.NewMACCredentials(secret1)
+		_ = _mc.Protect(msg)
+	}
 	msgDER, _ := msg.MarshalBinary()
 
 	resp, _ := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(msgDER)))
@@ -623,7 +636,10 @@ func TestPollReqWithDifferentCredentials(t *testing.T) {
 	pollMsg.Header.TransactionID = msg.Header.TransactionID
 	pollMsg.Header.RecipNonce = respMsg.Header.SenderNonce
 	pollMsg.Header.SenderKID = []byte("kid2")
-	{ _mc, _ := pkicmp.NewMACCredentials(secret2); _ = _mc.Protect(pollMsg) }
+	{
+		_mc, _ := pkicmp.NewMACCredentials(secret2)
+		_ = _mc.Protect(pollMsg)
+	}
 	pollDER, _ := pollMsg.MarshalBinary()
 
 	resp2, _ := http.Post(ts.URL, "application/pkixcmp", strings.NewReader(string(pollDER)))

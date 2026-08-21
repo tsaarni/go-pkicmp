@@ -15,15 +15,20 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"fmt"
 	"log/slog"
 	"math/big"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/tsaarni/go-pkicmp/server"
 )
+
+// oidKeyUsage identifies the RFC 5280 §4.2.1.3 keyUsage extension.
+var oidKeyUsage = asn1.ObjectIdentifier{2, 5, 29, 15}
 
 // MockCA implements [server.CA], [server.SecretLookup], and [server.CertificateLookup].
 type MockCA struct {
@@ -93,6 +98,15 @@ func (c *MockCA) IssueCertificate(_ context.Context, reqType server.RequestType,
 	tmpl.Issuer = c.cert.Subject
 	tmpl.NotBefore = time.Now().Add(-1 * time.Minute)
 	tmpl.NotAfter = time.Now().Add(365 * 24 * time.Hour)
+
+	// tmpl.ExtraExtensions holds what the requester asked for, and
+	// x509.CreateCertificate lets an extension there override the matching typed
+	// field. Without dropping it first, a requested keyUsage would silently
+	// replace the assignment below and the requester would choose its own key
+	// usage. Other requested extensions are left for this example to pass through.
+	tmpl.ExtraExtensions = slices.DeleteFunc(tmpl.ExtraExtensions, func(e pkix.Extension) bool {
+		return e.Id.Equal(oidKeyUsage)
+	})
 	tmpl.KeyUsage = x509.KeyUsageDigitalSignature
 
 	c.Log.Info("issuing certificate",
@@ -228,8 +242,10 @@ func generateSelfSignedCA() (*ecdsa.PrivateKey, *x509.Certificate, error) {
 		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
 		IsCA:                  true,
 		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		SubjectKeyId:          ski,
+		// digitalSignature is required because this same certificate is the CMP
+		// protection certificate passed to server.WithSigner (RFC 9483 §3.5).
+		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		SubjectKeyId: ski,
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)

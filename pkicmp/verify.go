@@ -5,27 +5,52 @@ import (
 	"crypto/hmac"
 	"crypto/subtle"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
 	"fmt"
+	"time"
 
 	"golang.org/x/crypto/cryptobyte"
 	"golang.org/x/crypto/pbkdf2"
 )
 
+// ProtectionMechanism identifies a class of message protection.
+type ProtectionMechanism int
+
+const (
+	// ProtectionAny accepts whichever mechanism the message carries. A server
+	// needs this to serve both shared-secret and certificate-based clients,
+	// because it cannot know which one a peer will use for the first message.
+	ProtectionAny ProtectionMechanism = iota
+	// ProtectionMAC accepts only shared-secret protection (PasswordBasedMac or PBMAC1).
+	ProtectionMAC
+	// ProtectionSignature accepts only signature-based protection.
+	ProtectionSignature
+)
+
 // VerifyOptions provides trust material for message protection verification.
 //
-// Verification dispatches based on the message's ProtectionAlg OID — not on
-// the credential type. This allows a client to verify responses regardless of
-// which protection mode the server chose:
+// Verification dispatches on the message's ProtectionAlg OID, so a caller that
+// supplies both a shared secret and a trust pool accepts whichever mechanism
+// the peer chose. Set RequiredProtection to pin the mechanism instead.
 //
-//   - MAC-protected response: uses the SharedSecret field.
-//   - Signature-protected response: uses TrustPool for chain verification.
-//
-// Both fields may be populated simultaneously. The verifier ignores whichever
-// is irrelevant for the actual algorithm in the message.
+//   - MAC-protected message: uses the SharedSecret field.
+//   - Signature-protected message: uses TrustPool for chain verification.
 //
 // RFC 9810 §5.1.3.
 type VerifyOptions struct {
+	// RequiredProtection restricts which protection mechanism is accepted.
+	// The zero value, ProtectionAny, accepts either one.
+	//
+	// Within a single PKI management operation the mechanism must not change:
+	// RFC 9483 §3.1 requires "the same kind of protection ... for all messages
+	// of that PKI management operation", and RFC 9810 §5.2.3 reserves the
+	// failInfo bit wrongIntegrity for a message that arrives "password based
+	// instead of signature or vice versa". Callers that know which mechanism
+	// they started an operation with should pin it here, otherwise a peer can
+	// substitute the mechanism it finds easier to satisfy.
+	RequiredProtection ProtectionMechanism
+
 	// SharedSecret is the shared secret for MAC-protected messages.
 	// For signature-protected messages this field is ignored (TrustPool is
 	// used instead). May be nil if only signature verification is needed.
@@ -41,6 +66,10 @@ type VerifyOptions struct {
 	// certificate without chain validation. This is used when the verifier has
 	// already resolved the sender's certificate from its own database.
 	// Takes precedence over TrustPool/ExtraCerts.
+	//
+	// The certificate still has to be within its validity period and to be the
+	// subject the header names, so resolving one by a key identifier alone does
+	// not let a peer attach any sender name it likes to it.
 	TrustedCert *x509.Certificate
 
 	// ExtraCerts provides candidate signer certificates (typically from
@@ -50,6 +79,16 @@ type VerifyOptions struct {
 	// SenderKID filters candidate signer certificates by SubjectKeyId
 	// (typically msg.Header.SenderKID).
 	SenderKID []byte
+
+	// RequireDigitalSignatureKeyUsage rejects a CMP protection certificate that
+	// carries a keyUsage extension without the digitalSignature bit, as
+	// RFC 9483 §3.5 requires.
+	//
+	// It is off by default because deployed CAs do not follow the rule. Nokia
+	// NCM 26.7 protects its CMP responses with the issuing CA certificate, whose
+	// keyUsage is keyCertSign and cRLSign only, so enabling this rejects every
+	// response from that server. Turn it on when every peer is known to conform.
+	RequireDigitalSignatureKeyUsage bool
 }
 
 // VerifyResult is returned on successful verification.
@@ -65,6 +104,17 @@ type VerifyResult struct {
 	// algorithm suite (fresh salt is generated). Nil for signature-verified messages.
 	// RFC 9810 §5.1.3.
 	ProtectionParams MACCredentialOption
+
+	// ProtectionCertificate is the certificate whose signature was accepted.
+	// Nil for MAC-verified messages.
+	//
+	// A peer is allowed to send extraCerts only on the first message of a PKI
+	// management operation (RFC 9810 §5.1), so a later message in the same
+	// operation can arrive with no candidate signer at all. Callers that keep
+	// this certificate can offer it back through [VerifyOptions.ExtraCerts] to
+	// verify those later messages, which still have to satisfy the chain,
+	// sender and signature checks against it.
+	ProtectionCertificate *x509.Certificate
 }
 
 // Verify verifies the message protection and returns verification metadata.
@@ -85,14 +135,22 @@ func (m *PKIMessage) Verify(opts VerifyOptions) (*VerifyResult, error) {
 
 	alg := m.Header.ProtectionAlg.Algorithm
 
-	// Dispatch based on algorithm OID.
-	if alg.Equal(oidPasswordBasedMac) {
-		return m.verifyPBM(opts)
-	}
-	if alg.Equal(oidPBMAC1) {
+	// Dispatch based on algorithm OID, after checking it against the mechanism
+	// the caller requires. Without this the peer picks the mechanism, which lets
+	// it substitute one the caller never intended to accept.
+	if alg.Equal(oidPasswordBasedMac) || alg.Equal(oidPBMAC1) {
+		if opts.RequiredProtection == ProtectionSignature {
+			return nil, &VerificationError{Reason: ReasonUnexpectedProtection, Err: fmt.Errorf("message is MAC-protected but signature-based protection is required")}
+		}
+		if alg.Equal(oidPasswordBasedMac) {
+			return m.verifyPBM(opts)
+		}
 		return m.verifyPBMAC1(opts)
 	}
 	if _, err := sigAlgFromOID(alg); err == nil {
+		if opts.RequiredProtection == ProtectionMAC {
+			return nil, &VerificationError{Reason: ReasonUnexpectedProtection, Err: fmt.Errorf("message is signature-protected but MAC-based protection is required")}
+		}
 		return m.verifySignature(opts)
 	}
 
@@ -185,14 +243,9 @@ func (m *PKIMessage) verifyPBMAC1(opts VerifyOptions) (*VerifyResult, error) {
 	}
 
 	// Parse PBKDF2-params from keyDerivationFunc.Parameters.
-	var pbkdf2Params struct {
-		Salt           []byte
-		IterationCount int
-		KeyLength      int
-		PRF            algorithmIdentifierASN1
-	}
-	if _, err := asn1.Unmarshal(pbmac1Params.KeyDerivationFunc.Parameters.FullBytes, &pbkdf2Params); err != nil {
-		return nil, &ParseError{Detail: "invalid PBKDF2-params: " + err.Error()}
+	pbkdf2Params, err := parsePBKDF2Params(pbmac1Params.KeyDerivationFunc.Parameters.FullBytes)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := validatePBMIterationCount(pbkdf2Params.IterationCount); err != nil {
@@ -203,8 +256,23 @@ func (m *PKIMessage) verifyPBMAC1(opts VerifyOptions) (*VerifyResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !prfHash.Available() {
+		return nil, &VerificationError{Reason: ReasonUnsupportedAlgorithm, Err: fmt.Errorf("PRF hash %v not available", pbkdf2Params.PRF.Algorithm)}
+	}
 	macHash, err := hmacHashFromOID(pbmac1Params.MessageAuthScheme.Algorithm)
 	if err != nil {
+		return nil, err
+	}
+	if !macHash.Available() {
+		return nil, &VerificationError{Reason: ReasonUnsupportedAlgorithm, Err: fmt.Errorf("MAC hash %v not available", pbmac1Params.MessageAuthScheme.Algorithm)}
+	}
+
+	// RFC 8018 §A.5: keyLength is OPTIONAL. When the peer omits it, §7.1 leaves the
+	// length to the MAC scheme, which for HMAC is the digest size.
+	if pbkdf2Params.KeyLength == 0 {
+		pbkdf2Params.KeyLength = macHash.Size()
+	}
+	if err := validatePBKDF2KeyLength(pbkdf2Params.KeyLength, macHash); err != nil {
 		return nil, err
 	}
 
@@ -253,10 +321,28 @@ func (m *PKIMessage) verifySignature(opts VerifyOptions) (*VerifyResult, error) 
 
 	// Direct verification against a pre-trusted certificate (server-side lookup).
 	if opts.TrustedCert != nil {
+		// The chain path gets expiry checking from x509.Verify. This path does
+		// not, so without this an expired certificate left in the verifier's
+		// database would keep authenticating forever.
+		now := time.Now()
+		if now.Before(opts.TrustedCert.NotBefore) || now.After(opts.TrustedCert.NotAfter) {
+			return nil, &VerificationError{Reason: ReasonCertificateExpired}
+		}
+		// RFC 9483 §3.5: the sender must be the subject of the protection
+		// certificate. Resolving a certificate from a database proves only that
+		// the verifier knows it, not that the message came from the identity the
+		// header claims, so a lookup keyed on senderKID alone would otherwise
+		// pair a genuine certificate with any sender name the peer chose.
+		if !senderMatchesCertificate(m.Header.Sender, opts.TrustedCert) {
+			return nil, &VerificationError{Reason: ReasonSenderMismatch}
+		}
+		if opts.RequireDigitalSignatureKeyUsage && !permittedToSign(opts.TrustedCert) {
+			return nil, &VerificationError{Reason: ReasonKeyUsageNotPermitted}
+		}
 		if err := opts.TrustedCert.CheckSignature(sigAlg, data, m.Protection); err != nil {
 			return nil, &VerificationError{Reason: ReasonSignatureFailed}
 		}
-		return &VerifyResult{MACVerified: false}, nil
+		return &VerifyResult{MACVerified: false, ProtectionCertificate: opts.TrustedCert}, nil
 	}
 
 	// Chain-based verification using TrustPool and ExtraCerts.
@@ -274,6 +360,13 @@ func (m *PKIMessage) verifySignature(opts VerifyOptions) (*VerifyResult, error) 
 		intermediates.AddCert(x509Cert)
 	}
 
+	// senderMismatch records that a candidate was rejected only because it did
+	// not belong to the named sender, so the caller can tell an identity problem
+	// apart from a cryptographic one. keyUsageRejected does the same for a
+	// certificate that is trusted and correctly named but not allowed to sign.
+	senderMismatch := false
+	keyUsageRejected := false
+
 	// RFC 9810 §5.1.3.3: Verify the signature using certificates from extraCerts.
 	for _, cert := range opts.ExtraCerts {
 		x509Cert, err := cert.Parse()
@@ -286,19 +379,73 @@ func (m *PKIMessage) verifySignature(opts VerifyOptions) (*VerifyResult, error) 
 				continue
 			}
 		}
-		// Verify trust chain.
+		// Verify trust chain. ExtKeyUsageAny is required because an empty
+		// KeyUsages makes crypto/x509 demand serverAuth, which no CMP
+		// specification asks for and which rejects the RFC 9810 §4.5
+		// certificates id-kp-cmcCA, id-kp-cmcRA and id-kp-cmKGA.
 		verifyOpts := x509.VerifyOptions{
 			Roots:         opts.TrustPool,
 			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 		}
 		if _, err := x509Cert.Verify(verifyOpts); err != nil {
 			continue
 		}
+		// RFC 9483 §3.5: the sender field must match the subject of the CMP
+		// protection certificate. Chaining to a trust anchor only proves the
+		// certificate is trusted, not that it belongs to the claimed sender, so
+		// without this any certificate under any configured anchor would pass.
+		if !senderMatchesCertificate(m.Header.Sender, x509Cert) {
+			senderMismatch = true
+			continue
+		}
+		if opts.RequireDigitalSignatureKeyUsage && !permittedToSign(x509Cert) {
+			keyUsageRejected = true
+			continue
+		}
 		// Check signature over protected part.
 		if err := x509Cert.CheckSignature(sigAlg, data, m.Protection); err == nil {
-			return &VerifyResult{MACVerified: false}, nil
+			return &VerifyResult{MACVerified: false, ProtectionCertificate: x509Cert}, nil
 		}
 	}
 
+	if senderMismatch {
+		return nil, &VerificationError{Reason: ReasonSenderMismatch}
+	}
+	if keyUsageRejected {
+		return nil, &VerificationError{Reason: ReasonKeyUsageNotPermitted}
+	}
 	return nil, &VerificationError{Reason: ReasonSignatureFailed}
+}
+
+// permittedToSign reports whether a CMP protection certificate may sign, per the RFC 9483 §3.5 digitalSignature rule.
+func permittedToSign(cert *x509.Certificate) bool {
+	// The requirement is conditional on the extension being present, so a
+	// certificate without keyUsage is unconstrained and remains acceptable.
+	// crypto/x509 reports KeyUsage as zero in both cases, so the extension list
+	// is what distinguishes "absent" from "present and empty".
+	for _, ext := range cert.Extensions {
+		if ext.Id.Equal(oidExtensionKeyUsage) {
+			return cert.KeyUsage&x509.KeyUsageDigitalSignature != 0
+		}
+	}
+	return true
+}
+
+// senderMatchesCertificate reports whether the header sender names the subject of the protection certificate.
+func senderMatchesCertificate(sender GeneralName, cert *x509.Certificate) bool {
+	// RFC 4210 §5.1.1 requires a NULL DN when the sender does not know its own
+	// name, and GeneralName has variants other than directoryName. There is no
+	// directory name to compare in those cases, so the binding does not apply
+	// and authenticity rests on the trust chain alone.
+	if len(sender.DirectoryName) == 0 {
+		return true
+	}
+	var subject pkix.RDNSequence
+	if _, err := asn1.Unmarshal(cert.RawSubject, &subject); err != nil {
+		return false
+	}
+	// Compare the decoded forms so that a name encoded as PrintableString in one
+	// place and UTF8String in the other still matches.
+	return sender.DirectoryName.String() == subject.String()
 }

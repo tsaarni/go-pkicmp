@@ -25,6 +25,15 @@
 // it must set SerialNumber and validity, and may enforce policy, override
 // the subject, add or strip extensions, or reject the request outright.
 //
+// The extensions in template.ExtraExtensions are the ones the requester asked
+// for, and nothing has vetted them. [x509.CreateCertificate] gives an extension
+// in ExtraExtensions precedence over the matching typed field, so assigning
+// template.KeyUsage does not override a requested keyUsage extension: the
+// assignment is silently discarded and the requested value is issued instead.
+// The same applies to ExtKeyUsage, BasicConstraints and the other typed fields.
+// A CA that means to decide an extension itself must drop it from
+// ExtraExtensions first, as the example below does for keyUsage.
+//
 // # Basic example
 //
 //	type myCA struct {
@@ -38,6 +47,11 @@
 //	    tmpl.SerialNumber = big.NewInt(time.Now().UnixNano())
 //	    tmpl.NotBefore = time.Now()
 //	    tmpl.NotAfter = time.Now().Add(365 * 24 * time.Hour)
+//
+//	    // Drop a requested keyUsage, otherwise it would override the one set below.
+//	    oidKeyUsage := asn1.ObjectIdentifier{2, 5, 29, 15}
+//	    tmpl.ExtraExtensions = slices.DeleteFunc(tmpl.ExtraExtensions,
+//	        func(e pkix.Extension) bool { return e.Id.Equal(oidKeyUsage) })
 //	    tmpl.KeyUsage = x509.KeyUsageDigitalSignature
 //
 //	    der, err := x509.CreateCertificate(rand.Reader, tmpl, c.cert, tmpl.PublicKey, c.key)
@@ -149,20 +163,38 @@
 //
 // # Middleware
 //
-// [NewCAServer] requires a handler wrapper that implements authorization and
+// [NewCAServer] takes a handler wrapper that implements authorization and
 // request validation. The server handles authentication (verifying protection)
 // but delegates authorization and other cross-cutting concerns (like audit logging,
 // metrics tracking, or rate limiting) to wrappers. Without validation wrappers,
-// any authenticated client could request any certificate.
+// any authenticated client could request any certificate for any name.
+//
+// Two checks are not delegated, because they establish that a request is what it
+// claims to be rather than whether a site wants to grant it, and a server built
+// with a nil policy would otherwise skip them:
+//
+//   - Proof of possession, so that a certificate is never issued for a public
+//     key the requester did not prove holding (RFC 4211 §4, RFC 9483 §5.1.1).
+//     For a p10cr this is the CSR self-signature.
+//   - Rejection of a BasicConstraints extension that cannot be decoded, so that
+//     no extension reaches [CA.IssueCertificate] that the checks above did not
+//     understand.
 //
 // [LightweightPolicy] enforces the RFC 9483 Lightweight CMP Profile:
 //
 //   - Verifies Proof-of-Possession (POP) on CRMF requests.
 //   - Requires KUR to use signature protection (not MAC).
-//   - Validates that extraCerts contains a complete chain for signature-protected requests.
+//   - Requires a MAC-protected message to identify its shared secret through
+//     either the sender name or senderKID.
 //   - Enforces subject presence in certificate templates.
 //   - Rejects requests for CA certificates.
 //   - Validates BasicConstraints path-length.
+//
+// Some RFC 9483 rules govern how a peer must construct a message rather than
+// how this server authenticates it, and widely deployed clients break them.
+// Those are off by default and enabled together with
+// [WithStrictProfileValidation], which is documented on the option.
+//
 // Add custom authorization policy and logging using [MiddlewareChain].
 // In this setup, `myPolicy()` runs before `LightweightPolicy()` to quickly reject
 // unauthorized requests before performing verification against lightweight policy:

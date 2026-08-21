@@ -139,14 +139,9 @@ func (m *PKIMessage) protectWithMACAlgorithm(secret []byte, alg *AlgorithmIdenti
 		if !params.KeyDerivationFunc.Algorithm.Equal(oidPBKDF2) {
 			return &ParseError{Detail: fmt.Sprintf("unsupported KDF: %v", params.KeyDerivationFunc.Algorithm)}
 		}
-		var kdfParams struct {
-			Salt           []byte
-			IterationCount int
-			KeyLength      int
-			PRF            algorithmIdentifierASN1
-		}
-		if _, err := asn1.Unmarshal(params.KeyDerivationFunc.Parameters.FullBytes, &kdfParams); err != nil {
-			return &ParseError{Detail: "invalid PBKDF2-params: " + err.Error()}
+		kdfParams, err := parsePBKDF2Params(params.KeyDerivationFunc.Parameters.FullBytes)
+		if err != nil {
+			return err
 		}
 		return m.protectWithPBMAC1Options(pbmac1Options{
 			Secret:         secret,
@@ -219,15 +214,21 @@ func (m *PKIMessage) protectWithPBMAC1Options(opts pbmac1Options) error {
 		return err
 	}
 
+	// RFC 8018 §A.5: keyLength is OPTIONAL, and §7.1 ties it to the MAC scheme.
+	// An echoed value reaches this point straight from a peer's message, so it is
+	// bounded here as well as on the verification path.
+	keyLen := opts.KeyLength
+	if keyLen == 0 {
+		keyLen = macHash.Size()
+	}
+	if err := validatePBKDF2KeyLength(keyLen, macHash); err != nil {
+		return err
+	}
+
 	// Generate random salt (RFC 8018 §7.1).
 	salt := make([]byte, defaultPBMSaltLength)
 	if _, err := rand.Read(salt); err != nil {
 		return err
-	}
-
-	keyLen := opts.KeyLength
-	if keyLen == 0 {
-		keyLen = macHash.Size()
 	}
 
 	// Build PBMAC1-params ASN.1 structure (RFC 8018 §A.5).
@@ -260,18 +261,21 @@ func (m *PKIMessage) protectWithPBMAC1Options(opts pbmac1Options) error {
 // marshalPBMAC1Params builds the PBMAC1-params ASN.1 structure.
 // RFC 8018 §A.5.
 func marshalPBMAC1Params(salt []byte, iterCount, keyLen int, prf, mac asn1.ObjectIdentifier) ([]byte, error) {
-	// PBKDF2-params: SEQUENCE { salt, iterationCount, keyLength, prf }
-	pbkdf2Params, err := asn1.Marshal(struct {
-		Salt           []byte
-		IterationCount int
-		KeyLength      int
-		PRF            algorithmIdentifierASN1
-	}{
+	// PBKDF2-params: SEQUENCE { salt, iterationCount, keyLength, prf }.
+	// Encoding through the same struct the parser uses keeps the two symmetric.
+	params := pbkdf2ParamsASN1{
 		Salt:           salt,
 		IterationCount: iterCount,
 		KeyLength:      keyLen,
-		PRF:            algorithmIdentifierASN1{Algorithm: prf},
-	})
+	}
+	// RFC 8018 §A.2 gives prf the default algid-hmacWithSHA1, and X.690 §11.5
+	// forbids encoding a component that holds its default value. Leaving the
+	// field zero makes encoding/asn1 omit it, which is what a peer that sent no
+	// prf gets back when its parameters are echoed.
+	if !prf.Equal(oidHMACWithSHA1) {
+		params.PRF = algorithmIdentifierASN1{Algorithm: prf}
+	}
+	pbkdf2Params, err := asn1.Marshal(params)
 	if err != nil {
 		return nil, err
 	}
@@ -290,6 +294,29 @@ func marshalPBMAC1Params(salt []byte, iterCount, keyLen int, prf, mac asn1.Objec
 type algorithmIdentifierASN1 struct {
 	Algorithm  asn1.ObjectIdentifier
 	Parameters asn1.RawValue `asn1:"optional"`
+}
+
+// pbkdf2ParamsASN1 mirrors PBKDF2-params (RFC 8018 §A.5). keyLength is OPTIONAL
+// and prf carries a DEFAULT, so DER omits both when they are not needed.
+type pbkdf2ParamsASN1 struct {
+	Salt           []byte
+	IterationCount int
+	KeyLength      int                     `asn1:"optional"`
+	PRF            algorithmIdentifierASN1 `asn1:"optional"`
+}
+
+// parsePBKDF2Params decodes PBKDF2-params and applies the RFC 8018 §A.5 default for an absent prf.
+func parsePBKDF2Params(der []byte) (*pbkdf2ParamsASN1, error) {
+	var p pbkdf2ParamsASN1
+	if _, err := asn1.Unmarshal(der, &p); err != nil {
+		return nil, &ParseError{Detail: "invalid PBKDF2-params: " + err.Error()}
+	}
+	// prf DEFAULT algid-hmacWithSHA1: DER requires the field to be omitted when it
+	// holds the default, so an absent prf means HMAC-SHA-1 rather than "unspecified".
+	if len(p.PRF.Algorithm) == 0 {
+		p.PRF.Algorithm = oidHMACWithSHA1
+	}
+	return &p, nil
 }
 
 // protectWithSignature signs the message using the given key.
@@ -314,11 +341,16 @@ func (m *PKIMessage) protectWithSignature(key crypto.Signer, cert *x509.Certific
 		m.Header.SenderKID = cert.SubjectKeyId
 	}
 
-	// Append cert and chain to ExtraCerts.
-	m.ExtraCerts = append(m.ExtraCerts, CMPCertificate{Raw: cert.Raw})
+	// RFC 9483 §3.3 requires the CMP protection certificate to be the first
+	// element of extraCerts, followed by its chain, so anything the caller
+	// already placed there moves behind them.
+	ordered := make([]CMPCertificate, 0, len(m.ExtraCerts)+len(chain)+1)
+	ordered = append(ordered, CMPCertificate{Raw: cert.Raw})
 	for _, c := range chain {
-		m.ExtraCerts = append(m.ExtraCerts, CMPCertificate{Raw: c.Raw})
+		ordered = append(ordered, CMPCertificate{Raw: c.Raw})
 	}
+	ordered = append(ordered, m.ExtraCerts...)
+	m.ExtraCerts = dedupeCertificates(ordered)
 
 	// Marshal header+body and compute signature.
 	if err := m.marshalForProtection(); err != nil {
@@ -351,6 +383,20 @@ func (m *PKIMessage) protectWithSignature(key crypto.Signer, cert *x509.Certific
 	}
 	m.Protection = sig
 	return nil
+}
+
+// dedupeCertificates keeps the first occurrence of each certificate and drops later repeats.
+func dedupeCertificates(certs []CMPCertificate) []CMPCertificate {
+	seen := make(map[string]struct{}, len(certs))
+	out := make([]CMPCertificate, 0, len(certs))
+	for _, c := range certs {
+		if _, dup := seen[string(c.Raw)]; dup {
+			continue
+		}
+		seen[string(c.Raw)] = struct{}{}
+		out = append(out, c)
+	}
+	return out
 }
 
 // marshalForProtection marshals header and body into rawHeader/rawBody for
@@ -448,6 +494,11 @@ var (
 	// but no maximum is specified by any RFC. PBKDF2 commonly uses 262144 (2^18).
 	defaultPBMMinIterationCount = 1
 	defaultPBMMaxIterationCount = 500000
+
+	// defaultPBKDF2MinKeyLength is the shortest PBMAC1 derived key accepted from a
+	// peer, in bytes. 128 bits is the conventional floor for a symmetric key and
+	// is well beyond exhaustive search.
+	defaultPBKDF2MinKeyLength = 16
 )
 
 func validatePBMIterationCount(iterationCount int) error {
@@ -456,6 +507,27 @@ func validatePBMIterationCount(iterationCount int) error {
 	}
 	if iterationCount > defaultPBMMaxIterationCount {
 		return &ParseError{Detail: fmt.Sprintf("PBM iterationCount too large: %d", iterationCount)}
+	}
+	return nil
+}
+
+// validatePBKDF2KeyLength bounds the PBMAC1 derived key length accepted from a peer.
+func validatePBKDF2KeyLength(keyLength int, macHash crypto.Hash) error {
+	// A very short derived key turns the key length into a forgery primitive: a
+	// peer that asks for a few bytes shrinks the key space to something
+	// searchable, so protection can be forged without ever learning the shared
+	// secret. The floor is an absolute key strength requirement rather than the
+	// MAC's digest size, because deriving 32 bytes for every MAC is common
+	// practice, including for HMAC-SHA-384 and HMAC-SHA-512, and rejecting it
+	// would break interoperability without buying any security.
+	if keyLength < defaultPBKDF2MinKeyLength {
+		return &ParseError{Detail: fmt.Sprintf("PBKDF2 keyLength too small: %d (minimum %d)", keyLength, defaultPBKDF2MinKeyLength)}
+	}
+	// An HMAC key longer than the hash block size is hashed down to the digest size,
+	// so a longer derived key adds no strength while multiplying PBKDF2 work.
+	maxKeyLength := macHash.New().BlockSize()
+	if keyLength > maxKeyLength {
+		return &ParseError{Detail: fmt.Sprintf("PBKDF2 keyLength too large: %d (maximum %d for this MAC)", keyLength, maxKeyLength)}
 	}
 	return nil
 }
